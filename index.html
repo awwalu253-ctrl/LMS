@@ -3283,7 +3283,7 @@
                                 </div>
                             </div>
                             <div>
-                                <button class="btn btn-small" onclick="editCourse(${course.id})">Edit</button>
+                                <button class="btn btn-small" onclick="editCourse('${course.id}')">Edit</button>
                                 <button class="btn btn-small btn-secondary" onclick="deleteCourse(${course.id})" 
                                         style="margin-left: 10px; background: #dc3545;">Delete</button>
                             </div>
@@ -3917,13 +3917,24 @@
         }
 
         async function loadAdminNotifications() {
-            if (!currentUser) return;
+            if (!currentUser || !currentUser.id) return;
 
             try {
                 const response = await fetch(`${API_URL}/notifications/${currentUser.id}`, {
                     credentials: 'include'
                 });
+
+                if (!response.ok) {
+                    throw new Error('Failed to load notifications');
+                }
+
                 const notifications = await response.json();
+
+                // Check if notifications is an array
+                if (!Array.isArray(notifications)) {
+                    console.error('Notifications is not an array:', notifications);
+                    return;
+                }
 
                 const unreadCount = notifications.filter(n => !n.is_read).length;
                 updateNotificationBadge(unreadCount, 'admin');
@@ -6334,7 +6345,7 @@
 
             document.querySelector('#createCourseModal h3').textContent = 'Create New Course';
             const form = document.querySelector('#createCourseModal form');
-            form.onsubmit = adminCreateCourse;
+            yform.onsubmit = adminCreateCourse;
             document.getElementById('createCourseModal').classList.add('active');
         }
 
@@ -7103,6 +7114,140 @@
             }
         }
 
+        async function editCourse(courseId) {
+            try {
+                console.log('Loading course details for ID:', courseId);
+
+                const response = await fetch(`${API_URL}/courses/${courseId}/admin-details`, {
+                    credentials: 'include'
+                });
+
+                console.log('Response status:', response.status);
+
+                if (!response.ok) {
+                    const error = await response.text();
+                    console.error('Error response:', error);
+                    showToast('Failed to load course details', 'error');
+                    return;
+                }
+
+                const course = await response.json();
+                console.log('Course data loaded:', course);
+
+                // Populate the form fields
+                document.getElementById('adminCourseId').value = course.id;
+                document.getElementById('adminCourseTitle').value = course.title;
+                document.getElementById('adminCourseCode').value = course.course_code;
+                document.getElementById('adminCourseCredits').value = course.credits;
+                document.getElementById('adminCourseDescription').value = course.description || '';
+                document.getElementById('adminCourseTeacherLock').value = course.teacher_lock ? '1' : '0';
+
+                // Set department and level if they exist in the form
+                const departmentSelect = document.getElementById('adminCourseDepartment');
+                const levelSelect = document.getElementById('adminCourseLevel');
+
+                if (departmentSelect && course.department) {
+                    departmentSelect.value = course.department;
+                }
+
+                if (levelSelect && course.level) {
+                    levelSelect.value = course.level;
+                }
+
+                // Update modal title
+                document.querySelector('#createCourseModal h3').textContent = 'Edit Course';
+
+                // Store course ID in a data attribute
+                const modal = document.getElementById('createCourseModal');
+                modal.setAttribute('data-course-id', course.id);
+
+                // Update form submit handler
+                const form = document.querySelector('#createCourseModal form');
+                form.onsubmit = function (e) {
+                    e.preventDefault();
+                    updateCourse(e, course.id);
+                };
+
+                // Show modal
+                document.getElementById('createCourseModal').classList.add('active');
+
+            } catch (error) {
+                console.error('Error loading course:', error);
+                showToast('Network error. Please check console for details', 'error');
+            }
+        }
+
+        async function updateCourse(e, courseId) {
+            e.preventDefault();
+
+            // Get course ID from parameter or modal attribute
+            const courseIdToUpdate = courseId || document.getElementById('createCourseModal').getAttribute('data-course-id');
+
+            if (!courseIdToUpdate) {
+                showToast('Course ID not found', 'error');
+                return;
+            }
+
+            const data = {
+                title: document.getElementById('adminCourseTitle').value,
+                course_code: document.getElementById('adminCourseCode').value,
+                credits: parseInt(document.getElementById('adminCourseCredits').value),
+                description: document.getElementById('adminCourseDescription').value,
+                teacher_lock: parseInt(document.getElementById('adminCourseTeacherLock').value),
+                status: 'active'
+            };
+
+            // Add department and level if they exist
+            const departmentSelect = document.getElementById('adminCourseDepartment');
+            const levelSelect = document.getElementById('adminCourseLevel');
+
+            if (departmentSelect && departmentSelect.value) {
+                data.department = departmentSelect.value;
+            }
+
+            if (levelSelect && levelSelect.value) {
+                data.level = levelSelect.value;
+            }
+
+            try {
+                const response = await fetch(`${API_URL}/admin/courses/${courseIdToUpdate}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data),
+                    credentials: 'include'
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    closeModal('createCourseModal');
+                    loadAllCoursesForAdmin();
+                    showToast('Course updated successfully!', 'success');
+
+                    // Reset modal for next use
+                    document.querySelector('#createCourseModal h3').textContent = 'Create New Course';
+                    const form = document.querySelector('#createCourseModal form');
+                    form.onsubmit = adminCreateCourse;
+                    document.getElementById('createCourseModal').removeAttribute('data-course-id');
+
+                    // Clear form fields
+                    document.getElementById('adminCourseTitle').value = '';
+                    document.getElementById('adminCourseCode').value = '';
+                    document.getElementById('adminCourseCredits').value = '';
+                    document.getElementById('adminCourseDescription').value = '';
+                    document.getElementById('adminCourseTeacherLock').value = '1';
+
+                    if (departmentSelect) departmentSelect.value = 'all';
+                    if (levelSelect) levelSelect.value = 'all';
+                } else {
+                    showToast(result.error || 'Failed to update course', 'error');
+                }
+            } catch (error) {
+                console.error('Error updating course:', error);
+                showToast('Network error. Please try again.', 'error');
+            }
+        }
+
         async function adminRemoveEnrollment(enrollmentId) {
             showConfirmation(
                 'Are you sure you want to remove this enrollment?',
@@ -7450,7 +7595,11 @@
             document.querySelectorAll('#adminDashboard .menu-item').forEach(m => m.classList.remove('active'));
 
             document.getElementById(sectionId).classList.add('active');
-            e.target.classList.add('active');
+
+            // Check if e is defined before using it
+            if (e && e.target) {
+                e.target.classList.add('active');
+            }
 
             switch (sectionId) {
                 case 'admin-approvals':

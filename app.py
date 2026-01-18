@@ -1979,7 +1979,7 @@ def get_course_admin_details(course_id):
         
         return jsonify(serialize_doc(course))
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)}), 500  
 
 @app.route('/api/admin/compulsory-courses', methods=['GET', 'POST', 'PUT'])
 @admin_required
