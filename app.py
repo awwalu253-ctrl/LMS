@@ -13,6 +13,7 @@ from bson import ObjectId
 from bson.json_util import dumps, loads
 from urllib.parse import quote_plus  # Added for password encoding
 from dotenv import load_dotenv  # Added for environment variables
+from pymongo.server_api import ServerApi  # Added for Server API
 
 # Load environment variables from .env file
 load_dotenv()
@@ -37,19 +38,35 @@ def get_mongo_uri():
     if env_uri:
         return env_uri
     
-    # Fallback for local development
+    # Fallback for local development - Updated with TLS settings
     username = "School_Lms"
     password = "gwrNKQH7KPPpK"
     encoded_password = quote_plus(password)
-    return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database?retryWrites=true&w=majority&appName=Cluster0"
+    return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database?retryWrites=true&w=majority&appName=Cluster0&tls=true&tlsAllowInvalidCertificates=false"
 
-MONGO_URI = get_mongo_uri()
 DATABASE_NAME = 'lms_database'
 
 def get_db():
     if 'db' not in g:
-        g.client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        MONGO_URI = get_mongo_uri()
+        # Updated connection with explicit TLS settings
+        g.client = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=10000,  # Increased timeout
+            tls=True,
+            tlsAllowInvalidCertificates=False,
+            server_api=ServerApi('1')  # Added Server API
+        )
         g.db = g.client[DATABASE_NAME]
+        
+        # Test connection immediately
+        try:
+            g.client.admin.command('ping')
+            print("✅ MongoDB connected successfully!")
+        except Exception as e:
+            print(f"❌ MongoDB connection failed: {e}")
+            raise
+    
     return g.db
 
 @app.teardown_appcontext
@@ -542,6 +559,17 @@ def health_check():
             'timestamp': datetime.utcnow().isoformat()
         }), 500
 
+# Debug route to check environment
+@app.route('/api/debug', methods=['GET'])
+def debug_info():
+    return jsonify({
+        'mongo_uri_exists': 'MONGO_URI' in os.environ,
+        'mongo_uri_length': len(os.environ.get('MONGO_URI', '')) if 'MONGO_URI' in os.environ else 0,
+        'python_version': os.environ.get('PYTHON_VERSION', 'Not set'),
+        'vercel': 'VERCEL' in os.environ,
+        'vercel_env': os.environ.get('VERCEL_ENV', 'Not set')
+    })
+
 if __name__ == '__main__':
     init_db()
     print("\n" + "="*60)
@@ -562,6 +590,7 @@ if __name__ == '__main__':
     print("   3. Data Processing")
     print("\n🔧 Health Check:")
     print("   🌐 http://localhost:5000/api/health")
+    print("   🐛 Debug Info: http://localhost:5000/api/debug")
     print("\n" + "="*60 + "\n")
     app.run(debug=True, port=5000, host='0.0.0.0', threaded=True)
 else:
