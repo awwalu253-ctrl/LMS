@@ -14,6 +14,9 @@ from bson import ObjectId
 from bson.json_util import dumps, loads
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
+import json
+from datetime import datetime
+from bson import ObjectId
 
 # Load environment variables from .env file
 load_dotenv()
@@ -119,14 +122,19 @@ def student_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+class JSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return json.JSONEncoder.default(self, obj)
+
 # Helper functions
 def serialize_doc(doc):
     if doc is None:
         return None
-    if '_id' in doc:
-        doc['id'] = str(doc['_id'])
-        del doc['_id']
-    return doc
+    return json.loads(json.dumps(doc, cls=JSONEncoder))
 
 def serialize_list(docs):
     return [serialize_doc(doc) for doc in docs]
