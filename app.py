@@ -355,7 +355,6 @@ def init_db():
 def index():
     return send_from_directory('.', 'index.html')
 
-# [REST OF YOUR ROUTES - ALL THE SAME AS BEFORE]
 # Authentication routes
 @app.route('/api/register', methods=['POST'])
 def register():
@@ -490,12 +489,14 @@ def login():
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
+# KEEP THIS TEACHER-LOGIN ROUTE (WITHOUT TEACHER CODE CHECK)
 @app.route('/api/teacher-login', methods=['POST'])
 def teacher_login():
     try:
         data = request.json
         db = get_db()
         
+        # Find teacher by email
         user = db.users.find_one({
             'email': data['email'],
             'role': 'teacher'
@@ -505,9 +506,7 @@ def teacher_login():
             if user['status'] == 'suspended':
                 return jsonify({'error': 'Your account has been suspended. Please contact administrator.'}), 403
             
-            if user['teacher_code'] != data.get('teacher_code'):
-                return jsonify({'error': 'Invalid teacher code'}), 401
-            
+            # Don't require teacher code for login - only for admin verification
             teacher_courses = list(db.teacher_courses.find(
                 {'teacher_id': user['_id']},
                 {'course_id': 1}
@@ -525,7 +524,7 @@ def teacher_login():
                 'first_name': user['first_name'],
                 'last_name': user['last_name'],
                 'role': user['role'],
-                'teacher_code': user['teacher_code'],
+                'teacher_code': user.get('teacher_code', ''),
                 'teacher_id': str(user['_id']),
                 'assigned_courses': serialize_list(courses)
             })
@@ -576,26 +575,31 @@ def check_session():
         })
     return jsonify({'logged_in': False})
 
-# Health check route
-@app.route('/api/health', methods=['GET'])
-def health_check():
+# Admin Teacher Management Routes
+@app.route('/api/admin/teachers', methods=['GET'])
+@admin_required
+def get_all_teachers():
     try:
         db = get_db()
-        db.command('ping')
-        return jsonify({
-            'status': 'healthy',
-            'database': 'connected',
-            'timestamp': datetime.utcnow().isoformat()
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'unhealthy',
-            'database': 'disconnected',
-            'error': str(e),
-            'timestamp': datetime.utcnow().isoformat()
-        }), 500
         
-# Add this route to your backend
+        # Get all teachers with their course count
+        teachers = list(db.users.find({'role': 'teacher'}).sort('created_at', -1))
+        
+        # Get course counts for each teacher
+        for teacher in teachers:
+            course_count = db.teacher_courses.count_documents({'teacher_id': teacher['_id']})
+            teacher['course_count'] = course_count
+            
+            # Get assigned courses
+            teacher_courses = list(db.teacher_courses.find({'teacher_id': teacher['_id']}))
+            course_ids = [tc['course_id'] for tc in teacher_courses]
+            courses = list(db.courses.find({'_id': {'$in': course_ids}}))
+            teacher['assigned_courses'] = serialize_list(courses)
+        
+        return jsonify(serialize_list(teachers))
+    except Exception as e:
+        return jsonify({'error': f'Failed to fetch teachers: {str(e)}'}), 500
+
 @app.route('/api/admin/teachers', methods=['POST'])
 @admin_required
 def create_teacher_account():
@@ -650,33 +654,7 @@ def create_teacher_account():
         return jsonify({'error': 'Duplicate key error. Email or teacher code already exists.'}), 400
     except Exception as e:
         return jsonify({'error': f'Failed to create teacher account: {str(e)}'}), 500
-    
-# Get all teachers (admin only)
-@app.route('/api/admin/teachers', methods=['GET'])
-@admin_required
-def get_all_teachers():
-    try:
-        db = get_db()
-        
-        # Get all teachers with their course count
-        teachers = list(db.users.find({'role': 'teacher'}).sort('created_at', -1))
-        
-        # Get course counts for each teacher
-        for teacher in teachers:
-            course_count = db.teacher_courses.count_documents({'teacher_id': teacher['_id']})
-            teacher['course_count'] = course_count
-            
-            # Get assigned courses
-            teacher_courses = list(db.teacher_courses.find({'teacher_id': teacher['_id']}))
-            course_ids = [tc['course_id'] for tc in teacher_courses]
-            courses = list(db.courses.find({'_id': {'$in': course_ids}}))
-            teacher['assigned_courses'] = serialize_list(courses)
-        
-        return jsonify(serialize_list(teachers))
-    except Exception as e:
-        return jsonify({'error': f'Failed to fetch teachers: {str(e)}'}), 500
 
-# Get teacher details
 @app.route('/api/admin/teachers/<teacher_id>/details', methods=['GET'])
 @admin_required
 def get_teacher_details(teacher_id):
@@ -710,7 +688,6 @@ def get_teacher_details(teacher_id):
     except Exception as e:
         return jsonify({'error': f'Failed to fetch teacher details: {str(e)}'}), 500
 
-# Update teacher account
 @app.route('/api/admin/teachers/<teacher_id>', methods=['PUT'])
 @admin_required
 def update_teacher_account(teacher_id):
@@ -767,7 +744,6 @@ def update_teacher_account(teacher_id):
     except Exception as e:
         return jsonify({'error': f'Failed to update teacher: {str(e)}'}), 500
 
-# Delete teacher account
 @app.route('/api/admin/teachers/<teacher_id>', methods=['DELETE'])
 @admin_required
 def delete_teacher_account(teacher_id):
@@ -788,52 +764,207 @@ def delete_teacher_account(teacher_id):
         return jsonify({'message': 'Teacher account deleted successfully'})
     except Exception as e:
         return jsonify({'error': f'Failed to delete teacher: {str(e)}'}), 500
-    
-@app.route('/api/teacher-login', methods=['POST'])
-def teacher_login():
+
+# Add these missing routes for admin dashboard functionality
+@app.route('/api/admin/students', methods=['GET'])
+@admin_required
+def get_all_students():
+    try:
+        db = get_db()
+        students = list(db.users.find({'role': 'student'}).sort('created_at', -1))
+        return jsonify(serialize_list(students))
+    except Exception as e:
+        return jsonify({'error': f'Failed to fetch students: {str(e)}'}), 500
+
+@app.route('/api/admin/students/<student_id>/status', methods=['POST'])
+@admin_required
+def update_student_status(student_id):
     try:
         data = request.json
         db = get_db()
         
-        # Find teacher by email
-        user = db.users.find_one({
-            'email': data['email'],
-            'role': 'teacher'
-        })
+        db.users.update_one(
+            {'_id': ObjectId(student_id)},
+            {'$set': {'status': data['status']}}
+        )
         
-        if user and check_password_hash(user['password'], data['password']):
-            if user['status'] == 'suspended':
-                return jsonify({'error': 'Your account has been suspended. Please contact administrator.'}), 403
-            
-            # REMOVE THIS CHECK for teacher code during login
-            # if user['teacher_code'] != data.get('teacher_code'):
-            #     return jsonify({'error': 'Invalid teacher code'}), 401
-            
-            teacher_courses = list(db.teacher_courses.find(
-                {'teacher_id': user['_id']},
-                {'course_id': 1}
-            ))
-            
-            course_ids = [tc['course_id'] for tc in teacher_courses]
-            courses = list(db.courses.find({'_id': {'$in': course_ids}}))
-            
-            session['user_id'] = str(user['_id'])
-            session['role'] = user['role']
-            session.permanent = True
+        return jsonify({'message': 'Student status updated successfully'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to update student status: {str(e)}'}), 500
+
+@app.route('/api/admin/students/<student_id>', methods=['DELETE'])
+@admin_required
+def delete_student(student_id):
+    try:
+        db = get_db()
+        
+        # Delete student enrollments first
+        db.enrollments.delete_many({'student_id': ObjectId(student_id)})
+        
+        # Delete student submissions
+        student_submissions = db.submissions.find({'student_id': ObjectId(student_id)})
+        for submission in student_submissions:
+            db.submissions.delete_one({'_id': submission['_id']})
+        
+        # Delete student account
+        db.users.delete_one({'_id': ObjectId(student_id)})
+        
+        return jsonify({'message': 'Student deleted successfully'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to delete student: {str(e)}'}), 500
+
+@app.route('/api/admin/students/<student_id>', methods=['PUT'])
+@admin_required
+def update_student_info(student_id):
+    try:
+        data = request.json
+        db = get_db()
+        
+        update_data = {}
+        allowed_fields = ['first_name', 'last_name', 'email', 'student_id', 
+                         'department', 'level', 'status', 'phone', 'address', 
+                         'gender', 'date_of_birth']
+        
+        for field in allowed_fields:
+            if field in data:
+                update_data[field] = data[field]
+        
+        if 'password' in data and data['password']:
+            update_data['password'] = generate_password_hash(data['password'])
+        
+        db.users.update_one(
+            {'_id': ObjectId(student_id)},
+            {'$set': update_data}
+        )
+        
+        return jsonify({'message': 'Student information updated successfully'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to update student: {str(e)}'}), 500
+
+# Add course management routes
+@app.route('/api/admin/courses', methods=['GET'])
+@admin_required
+def get_all_courses():
+    try:
+        db = get_db()
+        courses = list(db.courses.find().sort('created_at', -1))
+        
+        # Get teacher names for each course
+        for course in courses:
+            teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
+            teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
+            teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
+            teacher_names = [f"{t['first_name']} {t['last_name']}" for t in teachers]
+            course['teacher_names'] = ', '.join(teacher_names) if teacher_names else 'Not assigned'
+        
+        return jsonify(serialize_list(courses))
+    except Exception as e:
+        return jsonify({'error': f'Failed to fetch courses: {str(e)}'}), 500
+
+@app.route('/api/admin/courses', methods=['POST'])
+@admin_required
+def create_course():
+    try:
+        data = request.json
+        db = get_db()
+        
+        # Check if course code already exists
+        existing_course = db.courses.find_one({'course_code': data['course_code']})
+        if existing_course:
+            return jsonify({'error': 'Course code already exists'}), 400
+        
+        course_data = {
+            'title': data['title'],
+            'course_code': data['course_code'],
+            'credits': data['credits'],
+            'description': data.get('description', ''),
+            'teacher_lock': data.get('teacher_lock', True),
+            'status': 'active',
+            'level': data.get('level', 'all'),
+            'department': data.get('department', 'all'),
+            'is_compulsory': data.get('is_compulsory', False),
+            'created_at': datetime.utcnow()
+        }
+        
+        result = db.courses.insert_one(course_data)
+        
+        return jsonify({
+            'message': 'Course created successfully',
+            'course_id': str(result.inserted_id)
+        }), 201
+    except Exception as e:
+        return jsonify({'error': f'Failed to create course: {str(e)}'}), 500
+
+@app.route('/api/admin/courses/<course_id>', methods=['DELETE'])
+@admin_required
+def delete_course(course_id):
+    try:
+        db = get_db()
+        
+        # Check if course has enrollments
+        enrollment_count = db.enrollments.count_documents({'course_id': ObjectId(course_id)})
+        
+        if enrollment_count > 0:
+            # Deactivate instead of delete
+            db.courses.update_one(
+                {'_id': ObjectId(course_id)},
+                {'$set': {'status': 'inactive'}}
+            )
             return jsonify({
-                'id': str(user['_id']),
-                'email': user['email'],
-                'first_name': user['first_name'],
-                'last_name': user['last_name'],
-                'role': user['role'],
-                'teacher_code': user.get('teacher_code', ''),
-                'teacher_id': str(user['_id']),
-                'assigned_courses': serialize_list(courses)
+                'message': 'Course deactivated (has active enrollments)',
+                'deactivated': True
             })
         
-        return jsonify({'error': 'Invalid credentials'}), 401
+        # Delete course if no enrollments
+        db.courses.delete_one({'_id': ObjectId(course_id)})
+        db.teacher_courses.delete_many({'course_id': ObjectId(course_id)})
+        
+        return jsonify({'message': 'Course deleted successfully'})
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        return jsonify({'error': f'Failed to delete course: {str(e)}'}), 500
+
+@app.route('/api/admin/courses/<course_id>', methods=['PUT'])
+@admin_required
+def update_course(course_id):
+    try:
+        data = request.json
+        db = get_db()
+        
+        update_data = {}
+        allowed_fields = ['title', 'course_code', 'credits', 'description', 
+                         'teacher_lock', 'status', 'level', 'department', 'is_compulsory']
+        
+        for field in allowed_fields:
+            if field in data:
+                update_data[field] = data[field]
+        
+        db.courses.update_one(
+            {'_id': ObjectId(course_id)},
+            {'$set': update_data}
+        )
+        
+        return jsonify({'message': 'Course updated successfully'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to update course: {str(e)}'}), 500
+
+# Health check route
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    try:
+        db = get_db()
+        db.command('ping')
+        return jsonify({
+            'status': 'healthy',
+            'database': 'connected',
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'database': 'disconnected',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
 
 if __name__ == '__main__':
     init_db()
@@ -844,7 +975,7 @@ if __name__ == '__main__':
     print("   ➡️  http://localhost:5000")
     print("\n🔐 Login Credentials:")
     print("   👑 Admin:      admin@school.edu / admin123")
-    print("   👨‍🏫 Teacher:   teacher@school.edu / teacher123 / TCH001")
+    print("   👨‍🏫 Teacher:   teacher@school.edu / teacher123")
     print("   👨‍🎓 Students:  Register on the portal")
     print("\n📚 Level System:")
     print("   🏫 Middle School: MS1, MS2, MS3")
