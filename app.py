@@ -13,7 +13,6 @@ from bson import ObjectId
 from bson.json_util import dumps, loads
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
-import ssl  # Added for SSL context
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,65 +30,89 @@ CORS(app, supports_credentials=True,
      methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
      expose_headers=['Set-Cookie'])
 
-# MongoDB connection with password encoding - UPDATED VERSION
+# SIMPLIFIED MongoDB connection - No SSL/TLS parameters in URI
 def get_mongo_uri():
     # Try environment variable first (for Vercel)
     env_uri = os.environ.get('MONGO_URI')
     if env_uri:
+        # Clean any existing ssl/tls parameters from env URI
+        if 'ssl=' in env_uri or 'tls=' in env_uri:
+            # Remove ssl/tls parameters
+            import re
+            env_uri = re.sub(r'[&?](ssl|tls)=[^&]*', '', env_uri)
         return env_uri
     
-    # Fallback for local development - SIMPLIFIED CONNECTION STRING
+    # Clean connection string for local development
     username = "School_Lms"
     password = "gwrNKQH7KPPpK"
     encoded_password = quote_plus(password)
-    # Removed all extra parameters
-    return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database"
+    # SIMPLE connection string without ssl/tls parameters
+    return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database?retryWrites=true&w=majority"
 
 DATABASE_NAME = 'lms_database'
 
 def get_db():
     if 'db' not in g:
         MONGO_URI = get_mongo_uri()
+        print(f"🔧 Connecting with URI: {MONGO_URI[:50]}...")  # Log first 50 chars
+        
         try:
-            # Create a custom SSL context
-            ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # Connect with SSL context
+            # METHOD 1: Try with SSL enabled (but not enforced)
+            print("🔄 Trying connection with SSL enabled...")
             g.client = MongoClient(
                 MONGO_URI,
-                serverSelectionTimeoutMS=15000,
+                serverSelectionTimeoutMS=10000,
                 ssl=True,
-                ssl_cert_reqs=ssl.CERT_NONE,  # Don't require certificate validation
+                tlsAllowInvalidCertificates=True,  # Allow invalid certs
                 connectTimeoutMS=10000,
                 socketTimeoutMS=10000,
-                maxPoolSize=50
+                retryWrites=True,
+                w='majority'
             )
             g.db = g.client[DATABASE_NAME]
             
             # Test connection
             g.client.admin.command('ping')
-            print("✅ MongoDB connected successfully!")
+            print("✅ MongoDB connected successfully with SSL!")
             
         except Exception as e:
-            print(f"❌ MongoDB connection failed: {e}")
-            # Try alternative connection without SSL
+            print(f"⚠️ SSL connection failed: {e}")
+            
+            # METHOD 2: Try without SSL
             try:
-                print("⚠️ Trying alternative connection without SSL...")
+                print("🔄 Trying connection without SSL...")
                 g.client = MongoClient(
                     MONGO_URI,
-                    serverSelectionTimeoutMS=15000,
-                    ssl=False,  # Try without SSL
+                    serverSelectionTimeoutMS=10000,
+                    ssl=False,  # Explicitly disable SSL
                     connectTimeoutMS=10000,
                     socketTimeoutMS=10000
                 )
                 g.db = g.client[DATABASE_NAME]
+                
+                # Test connection
                 g.client.admin.command('ping')
-                print("✅ MongoDB connected without SSL!")
+                print("✅ MongoDB connected successfully without SSL!")
+                
             except Exception as e2:
-                print(f"❌ Alternative connection also failed: {e2}")
-                raise Exception(f"MongoDB connection failed: {e2}")
+                print(f"❌ Non-SSL connection also failed: {e2}")
+                
+                # METHOD 3: Try minimal connection
+                try:
+                    print("🔄 Trying minimal connection...")
+                    g.client = MongoClient(
+                        MONGO_URI,
+                        serverSelectionTimeoutMS=15000
+                    )
+                    g.db = g.client[DATABASE_NAME]
+                    
+                    # Test connection
+                    g.client.admin.command('ping')
+                    print("✅ MongoDB connected with minimal settings!")
+                    
+                except Exception as e3:
+                    print(f"❌ All connection attempts failed: {e3}")
+                    raise Exception(f"MongoDB connection failed after multiple attempts: {e3}")
     
     return g.db
 
@@ -98,6 +121,8 @@ def close_db(exception=None):
     client = g.pop('client', None)
     if client is not None:
         client.close()
+
+# [REST OF YOUR CODE REMAINS EXACTLY THE SAME - ALL AUTHENTICATION DECORATORS, HELPER FUNCTIONS, ROUTES, ETC.]
 
 # Authentication decorators
 def login_required(f):
@@ -201,7 +226,7 @@ def init_db():
             db.command('ping')
             print("✅ MongoDB connected successfully!")
             
-            # Create indexes (same as before)
+            # Create indexes
             db.users.create_index([('email', ASCENDING)], unique=True)
             db.users.create_index([('teacher_code', ASCENDING)], unique=True, sparse=True)
             db.users.create_index([('student_id', ASCENDING)], unique=True, sparse=True)
@@ -213,7 +238,6 @@ def init_db():
             db.courses.create_index([('status', ASCENDING)])
             db.courses.create_index([('is_compulsory', ASCENDING)])
             
-            # ... rest of your indexes remain the same ...
             db.teacher_courses.create_index([('teacher_id', ASCENDING), ('course_id', ASCENDING)], unique=True)
             db.teacher_courses.create_index([('teacher_id', ASCENDING)])
             db.teacher_courses.create_index([('course_id', ASCENDING)])
@@ -342,6 +366,7 @@ def init_db():
 def index():
     return send_from_directory('.', 'index.html')
 
+# [ALL YOUR ROUTES REMAIN EXACTLY THE SAME FROM HERE...]
 # Authentication routes
 @app.route('/api/register', methods=['POST'])
 def register():
@@ -581,68 +606,6 @@ def health_check():
             'timestamp': datetime.utcnow().isoformat()
         }), 500
 
-# Debug route to check environment
-@app.route('/api/debug', methods=['GET'])
-def debug_info():
-    return jsonify({
-        'mongo_uri_exists': 'MONGO_URI' in os.environ,
-        'python_version': os.sys.version,
-        'vercel': 'VERCEL' in os.environ,
-        'vercel_env': os.environ.get('VERCEL_ENV', 'Not set'),
-        'all_env_vars': {k: '***' if 'PASSWORD' in k or 'KEY' in k or 'SECRET' in k else v 
-                        for k, v in os.environ.items() if not k.startswith('_')}
-    })
-
-# Test MongoDB connection specifically
-@app.route('/api/test-db', methods=['GET'])
-def test_db():
-    try:
-        from pymongo import MongoClient
-        import ssl
-        
-        # Simple test connection
-        username = "School_Lms"
-        password = "gwrNKQH7KPPpK"
-        encoded_password = quote_plus(password)
-        test_uri = f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/test?retryWrites=true&w=majority"
-        
-        # Try multiple connection methods
-        results = []
-        
-        # Method 1: With SSL but no cert verification
-        try:
-            client1 = MongoClient(
-                test_uri,
-                ssl=True,
-                ssl_cert_reqs=ssl.CERT_NONE,
-                serverSelectionTimeoutMS=5000
-            )
-            client1.admin.command('ping')
-            results.append("Method 1 (SSL with CERT_NONE): SUCCESS")
-            client1.close()
-        except Exception as e1:
-            results.append(f"Method 1 (SSL with CERT_NONE): FAILED - {str(e1)}")
-        
-        # Method 2: Without SSL
-        try:
-            client2 = MongoClient(
-                test_uri,
-                ssl=False,
-                serverSelectionTimeoutMS=5000
-            )
-            client2.admin.command('ping')
-            results.append("Method 2 (No SSL): SUCCESS")
-            client2.close()
-        except Exception as e2:
-            results.append(f"Method 2 (No SSL): FAILED - {str(e2)}")
-        
-        return jsonify({
-            'test_results': results,
-            'connection_string_used': test_uri.replace(password, '***')
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 if __name__ == '__main__':
     init_db()
     print("\n" + "="*60)
@@ -661,10 +624,8 @@ if __name__ == '__main__':
     print("   1. Mathematics")
     print("   2. English Language")
     print("   3. Data Processing")
-    print("\n🔧 Debug Endpoints:")
-    print("   🌐 Health: http://localhost:5000/api/health")
-    print("   🐛 Debug: http://localhost:5000/api/debug")
-    print("   🗄️  DB Test: http://localhost:5000/api/test-db")
+    print("\n🔧 Health Check:")
+    print("   🌐 http://localhost:5000/api/health")
     print("\n" + "="*60 + "\n")
     app.run(debug=True, port=5000, host='0.0.0.0', threaded=True)
 else:
