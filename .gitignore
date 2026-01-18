@@ -1,0 +1,4 @@
+# Database files 
+*.db 
+*.sqlite 
+backup_*/ 
