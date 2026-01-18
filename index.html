@@ -3182,127 +3182,68 @@
 
         // Update the loadAllCoursesForAdmin function to display compulsory courses properly
         async function loadAllCoursesForAdmin() {
-            try {
-                const response = await fetch(`${API_URL}/admin/compulsory-courses`, {
-                    credentials: 'include'
-                });
+    try {
+        const response = await fetch(`${API_URL}/admin/courses`, {
+            credentials: 'include'
+        });
 
-                if (!response.ok) {
-                    throw new Error('Failed to load compulsory courses');
-                }
-
-                const compulsoryCoursesByLevel = await response.json();
-
-                // Also load all courses for non-compulsory courses
-                const allCoursesResponse = await fetch(`${API_URL}/admin/courses`, {
-                    credentials: 'include'
-                });
-                const allCourses = await allCoursesResponse.json();
-
-                let html = '';
-
-                // Display compulsory courses by level
-                for (const [level, courses] of Object.entries(compulsoryCoursesByLevel)) {
-                    if (courses.length > 0) {
-                        html += `
-                    <div style="margin-bottom: 30px;">
-                        <h3 style="color: #28a745; margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
-                            <i class="bi bi-check-circle"></i> Compulsory Courses - ${level}
-                        </h3>
-                        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px;">
-                `;
-
-                        for (const course of courses) {
-                            html += `
-                        <div class="list-item" style="border-left: 4px solid #28a745;">
-                            <div style="display: flex; justify-content: space-between; align-items: start;">
-                                <div style="flex: 1;">
-                                    <h4>${course.title} <span class="badge" style="background: #28a745; margin-left: 5px;">Compulsory</span></h4>
-                                    <p style="color: #666; font-size: 14px; margin: 5px 0;">${course.description || ''}</p>
-                                    <div style="display: flex; gap: 8px; margin-top: 10px;">
-                                        <span class="badge" style="background: #667eea; font-size: 11px;">
-                                            ${course.course_code}
-                                        </span>
-                                        <span class="badge" style="background: #6c757d; font-size: 11px;">
-                                            ${course.credits} credits
-                                        </span>
-                                        <span class="badge" style="background: #17a2b8; font-size: 11px;">
-                                            Level: ${course.level}
-                                        </span>
-                                    </div>
-                                </div>
-                                <div style="display: flex; flex-direction: column; gap: 5px;">
-                                    <button class="btn btn-small" onclick="editCompulsoryCourse(${course.id})">
-                                        <i class="bi bi-pencil-square"></i> Edit
-                                    </button>
-                                    <button class="btn btn-small btn-secondary" onclick="deleteCompulsoryCourse(${course.id}, '${course.title}')" 
-                                            style="background: #dc3545;">
-                                        <i class="bi bi-trash-fill"></i> Delete
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    `;
-                        }
-
-                        html += `
-                        </div>
-                    </div>
-                `;
-                    }
-                }
-
-                // Display non-compulsory courses
-                const nonCompulsoryCourses = allCourses.filter(course => course.is_compulsory !== 1);
-                if (nonCompulsoryCourses.length > 0) {
-                    html += `
-                <div style="margin-top: 40px;">
-                    <h3 style="color: #667eea; margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
-                        <i class="bi bi-journals"></i> Departmental & Elective Courses
-                    </h3>
-            `;
-
-                    for (const course of nonCompulsoryCourses) {
-                        html += `
-                    <div class="list-item" id="course-${course.id}">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>
-                                <h4>${course.title}</h4>
-                                <p>${course.description || ''}</p>
-                                <div style="display: flex; gap: 10px; margin-top: 10px;">
-                                    <span class="badge" style="background: #6c757d;">Credits: ${course.credits}</span>
-                                    <span class="badge" style="background: ${course.teacher_lock ? '#dc3545' : '#28a745'}">
-                                        ${course.teacher_lock ? 'Single Teacher' : 'Multiple Teachers'}
-                                    </span>
-                                    <span class="badge" style="background: #17a2b8;">
-                                        Teacher: ${course.teacher_name || 'Not assigned'}
-                                    </span>
-                                    <span class="badge" style="background: ${course.status === 'active' ? '#28a745' : '#6c757d'}">
-                                        ${course.status}
-                                    </span>
-                                </div>
-                            </div>
-                            <div>
-                                <button class="btn btn-small" onclick="editCourse('${course.id}')">Edit</button>
-                                <button class="btn btn-small btn-secondary" onclick="deleteCourse(${course.id})" 
-                                        style="margin-left: 10px; background: #dc3545;">Delete</button>
-                            </div>
-                        </div>
-                    </div>
-                `;
-                    }
-
-                    html += `</div>`;
-                }
-
-                document.getElementById('adminCoursesList').innerHTML = html ||
-                    '<p style="color: #666; text-align: center; padding: 40px;">No courses found. Create your first course!</p>';
-            } catch (error) {
-                console.error('Error loading courses:', error);
-                document.getElementById('adminCoursesList').innerHTML =
-                    '<p style="color: #dc3545; text-align: center; padding: 40px;">Failed to load courses. Please try again.</p>';
-            }
+        if (!response.ok) {
+            throw new Error('Failed to load courses');
         }
+
+        const courses = await response.json();
+        console.log('Courses loaded:', courses);
+
+        if (courses.length === 0) {
+            document.getElementById('adminCoursesList').innerHTML =
+                '<p style="color: #666; text-align: center; padding: 40px;">No courses found. Create your first course!</p>';
+            return;
+        }
+
+        const html = courses.map(course => {
+            console.log('Course ID:', course.id, 'Type:', typeof course.id);
+            return `
+            <div class="list-item" id="course-${course.id}">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <h4>${course.title} (${course.course_code})</h4>
+                        <p>${course.description}</p>
+                        <div style="display: flex; gap: 10px; margin-top: 10px;">
+                            <span class="badge" style="background: #6c757d;">Credits: ${course.credits}</span>
+                            <span class="badge" style="background: ${course.teacher_lock ? '#dc3545' : '#28a745'}">
+                                ${course.teacher_lock ? 'Single Teacher' : 'Multiple Teachers'}
+                            </span>
+                            <span class="badge" style="background: #17a2b8;">
+                                Teacher: ${course.teacher_name || 'Not assigned'}
+                            </span>
+                            <span class="badge" style="background: ${course.status === 'active' ? '#28a745' : '#6c757d'}">
+                                ${course.status}
+                            </span>
+                            <span class="badge" style="background: ${getDepartmentColor(course.department)};">
+                                ${course.department}
+                            </span>
+                            <span class="badge" style="background: #ffc107;">
+                                ${course.level}
+                            </span>
+                        </div>
+                    </div>
+                    <div>
+                        <button class="btn btn-small" onclick="editCourse('${course.id}')">Edit</button>
+                        <button class="btn btn-small btn-secondary" onclick="deleteCourse('${course.id}')" 
+                                style="margin-left: 10px; background: #dc3545;">Delete</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        }).join('');
+
+        document.getElementById('adminCoursesList').innerHTML = html;
+    } catch (error) {
+        console.error('Error loading courses:', error);
+        document.getElementById('adminCoursesList').innerHTML =
+            '<p style="color: #dc3545; text-align: center; padding: 40px;">Failed to load courses. Please try again.</p>';
+    }
+}
 
         // ==============================================
         // CONFIRMATION MODAL SYSTEM

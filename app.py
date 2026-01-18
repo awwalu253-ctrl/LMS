@@ -134,7 +134,28 @@ class JSONEncoder(json.JSONEncoder):
 def serialize_doc(doc):
     if doc is None:
         return None
-    return json.loads(json.dumps(doc, cls=JSONEncoder))
+    
+    # Create a copy to avoid modifying the original
+    doc_dict = dict(doc)
+    
+    # Convert ObjectId to string
+    if '_id' in doc_dict:
+        doc_dict['id'] = str(doc_dict['_id'])
+        del doc_dict['_id']
+    
+    # Convert any remaining ObjectIds
+    for key, value in doc_dict.items():
+        if isinstance(value, ObjectId):
+            doc_dict[key] = str(value)
+        elif isinstance(value, datetime):
+            doc_dict[key] = value.isoformat()
+        elif isinstance(value, list):
+            # Recursively handle lists
+            doc_dict[key] = [str(item) if isinstance(item, ObjectId) else 
+                            item.isoformat() if isinstance(item, datetime) else 
+                            item for item in value]
+    
+    return doc_dict
 
 def serialize_list(docs):
     return [serialize_doc(doc) for doc in docs]
@@ -1963,32 +1984,36 @@ def get_course_admin_details(course_id):
     try:
         print(f"=== GET COURSE ADMIN DETAILS ===")
         print(f"Course ID received: {course_id}")
-        print(f"Session user: {session.get('user_id')}")
-        print(f"Session role: {session.get('role')}")
-        
-        # Check if user is admin
-        if session.get('role') != 'admin':
-            print("User is not admin")
-            return jsonify({'error': 'Admin access required'}), 403
+        print(f"Type of course_id: {type(course_id)}")
         
         db = get_db()
         
-        # Try to convert to ObjectId
-        try:
-            obj_id = ObjectId(course_id)
-            print(f"Successfully converted to ObjectId: {obj_id}")
-        except Exception as e:
-            print(f"Failed to convert to ObjectId: {e}")
-            return jsonify({'error': 'Invalid course ID format'}), 400
+        # First, try to find by string ID field (if courses have an 'id' field)
+        course = db.courses.find_one({'id': course_id})
         
-        # Find course
-        course = db.courses.find_one({'_id': obj_id})
+        # If not found by string ID, try ObjectId
+        if not course:
+            try:
+                obj_id = ObjectId(course_id)
+                course = db.courses.find_one({'_id': obj_id})
+            except:
+                print(f"Failed to convert to ObjectId: {course_id}")
+                # Try as integer ID
+                try:
+                    course = db.courses.find_one({'id': int(course_id)})
+                except:
+                    pass
         
         if not course:
-            print(f"Course not found with ID: {course_id}")
+            print(f"Course not found with any ID method: {course_id}")
+            # Try one more time - look for any course to debug
+            all_courses = list(db.courses.find().limit(5))
+            print(f"First 5 courses in DB: {[(str(c['_id']), c.get('title')) for c in all_courses]}")
             return jsonify({'error': 'Course not found'}), 404
         
         print(f"Course found: {course.get('title')}")
+        print(f"Course _id: {course.get('_id')}")
+        print(f"Course id field: {course.get('id')}")
         
         # Get teacher info
         teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
@@ -2002,7 +2027,7 @@ def get_course_admin_details(course_id):
         
         # Serialize the course
         serialized_course = serialize_doc(course)
-        print(f"Serialized course: {serialized_course}")
+        print(f"Serialized course keys: {serialized_course.keys()}")
         
         return jsonify(serialized_course)
         
@@ -2012,7 +2037,7 @@ def get_course_admin_details(course_id):
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
-
+    
 @app.route('/api/admin/compulsory-courses', methods=['GET', 'POST', 'PUT'])
 @admin_required
 def admin_compulsory_courses():
