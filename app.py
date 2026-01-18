@@ -1961,11 +1961,34 @@ def admin_update_course(course_id):
 @admin_required
 def get_course_admin_details(course_id):
     try:
+        print(f"=== GET COURSE ADMIN DETAILS ===")
+        print(f"Course ID received: {course_id}")
+        print(f"Session user: {session.get('user_id')}")
+        print(f"Session role: {session.get('role')}")
+        
+        # Check if user is admin
+        if session.get('role') != 'admin':
+            print("User is not admin")
+            return jsonify({'error': 'Admin access required'}), 403
+        
         db = get_db()
-        course = db.courses.find_one({'_id': ObjectId(course_id)})
+        
+        # Try to convert to ObjectId
+        try:
+            obj_id = ObjectId(course_id)
+            print(f"Successfully converted to ObjectId: {obj_id}")
+        except Exception as e:
+            print(f"Failed to convert to ObjectId: {e}")
+            return jsonify({'error': 'Invalid course ID format'}), 400
+        
+        # Find course
+        course = db.courses.find_one({'_id': obj_id})
         
         if not course:
+            print(f"Course not found with ID: {course_id}")
             return jsonify({'error': 'Course not found'}), 404
+        
+        print(f"Course found: {course.get('title')}")
         
         # Get teacher info
         teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
@@ -1977,9 +2000,18 @@ def get_course_admin_details(course_id):
         enrollment_count = db.enrollments.count_documents({'course_id': course['_id']})
         course['enrollment_count'] = enrollment_count
         
-        return jsonify(serialize_doc(course))
+        # Serialize the course
+        serialized_course = serialize_doc(course)
+        print(f"Serialized course: {serialized_course}")
+        
+        return jsonify(serialized_course)
+        
     except Exception as e:
-        return jsonify({'error': str(e)}), 500  
+        print(f"=== ERROR IN GET COURSE ADMIN DETAILS ===")
+        print(f"Error: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/compulsory-courses', methods=['GET', 'POST', 'PUT'])
 @admin_required

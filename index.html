@@ -7115,67 +7115,82 @@
         }
 
         async function editCourse(courseId) {
+    try {
+        console.log('=== EDIT COURSE DEBUG ===');
+        console.log('Course ID:', courseId);
+        console.log('API URL:', `${API_URL}/courses/${courseId}/admin-details`);
+        console.log('Current User:', currentUser);
+        
+        const response = await fetch(`${API_URL}/courses/${courseId}/admin-details`, {
+            credentials: 'include'
+        });
+
+        console.log('Response Status:', response.status);
+        console.log('Response Headers:', response.headers);
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('Error Response Text:', errorText);
+            
             try {
-                console.log('Loading course details for ID:', courseId);
-
-                const response = await fetch(`${API_URL}/courses/${courseId}/admin-details`, {
-                    credentials: 'include'
-                });
-
-                console.log('Response status:', response.status);
-
-                if (!response.ok) {
-                    const error = await response.text();
-                    console.error('Error response:', error);
-                    showToast('Failed to load course details', 'error');
-                    return;
-                }
-
-                const course = await response.json();
-                console.log('Course data loaded:', course);
-
-                // Populate the form fields
-                document.getElementById('adminCourseId').value = course.id;
-                document.getElementById('adminCourseTitle').value = course.title;
-                document.getElementById('adminCourseCode').value = course.course_code;
-                document.getElementById('adminCourseCredits').value = course.credits;
-                document.getElementById('adminCourseDescription').value = course.description || '';
-                document.getElementById('adminCourseTeacherLock').value = course.teacher_lock ? '1' : '0';
-
-                // Set department and level if they exist in the form
-                const departmentSelect = document.getElementById('adminCourseDepartment');
-                const levelSelect = document.getElementById('adminCourseLevel');
-
-                if (departmentSelect && course.department) {
-                    departmentSelect.value = course.department;
-                }
-
-                if (levelSelect && course.level) {
-                    levelSelect.value = course.level;
-                }
-
-                // Update modal title
-                document.querySelector('#createCourseModal h3').textContent = 'Edit Course';
-
-                // Store course ID in a data attribute
-                const modal = document.getElementById('createCourseModal');
-                modal.setAttribute('data-course-id', course.id);
-
-                // Update form submit handler
-                const form = document.querySelector('#createCourseModal form');
-                form.onsubmit = function (e) {
-                    e.preventDefault();
-                    updateCourse(e, course.id);
-                };
-
-                // Show modal
-                document.getElementById('createCourseModal').classList.add('active');
-
-            } catch (error) {
-                console.error('Error loading course:', error);
-                showToast('Network error. Please check console for details', 'error');
+                const errorJson = JSON.parse(errorText);
+                console.error('Error JSON:', errorJson);
+                showToast(errorJson.error || `Failed to load course details (${response.status})`, 'error');
+            } catch (e) {
+                console.error('Could not parse error as JSON:', errorText);
+                showToast(`Failed to load course details: ${response.status} ${response.statusText}`, 'error');
             }
+            return;
         }
+
+        const course = await response.json();
+        console.log('Course Data:', course);
+
+        // Populate the form fields
+        document.getElementById('adminCourseId').value = course.id;
+        document.getElementById('adminCourseTitle').value = course.title;
+        document.getElementById('adminCourseCode').value = course.course_code;
+        document.getElementById('adminCourseCredits').value = course.credits;
+        document.getElementById('adminCourseDescription').value = course.description || '';
+        document.getElementById('adminCourseTeacherLock').value = course.teacher_lock ? '1' : '0';
+        
+        // Set department and level if they exist in the form
+        const departmentSelect = document.getElementById('adminCourseDepartment');
+        const levelSelect = document.getElementById('adminCourseLevel');
+        
+        if (departmentSelect && course.department) {
+            departmentSelect.value = course.department;
+        }
+        
+        if (levelSelect && course.level) {
+            levelSelect.value = course.level;
+        }
+
+        // Update modal title
+        document.querySelector('#createCourseModal h3').textContent = 'Edit Course';
+        
+        // Store course ID in a data attribute
+        const modal = document.getElementById('createCourseModal');
+        modal.setAttribute('data-course-id', course.id);
+
+        // Update form submit handler
+        const form = document.querySelector('#createCourseModal form');
+        form.onsubmit = function(e) {
+            e.preventDefault();
+            updateCourse(e, course.id);
+        };
+
+        // Show modal
+        document.getElementById('createCourseModal').classList.add('active');
+        console.log('=== EDIT COURSE SUCCESS ===');
+        
+    } catch (error) {
+        console.error('=== EDIT COURSE CATCH ERROR ===');
+        console.error('Error:', error);
+        console.error('Error stack:', error.stack);
+        showToast('Network error. Please check console for details', 'error');
+    }
+}
 
         async function updateCourse(e, courseId) {
             e.preventDefault();
