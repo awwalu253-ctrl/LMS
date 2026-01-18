@@ -3435,124 +3435,124 @@
         // ==============================================
 
         async function handleStudentLogin(e) {
-    e.preventDefault();
-    
-    // Get form values
-    const email = document.getElementById('studentLoginEmail').value.trim();
-    const password = document.getElementById('studentLoginPassword').value;
-    
-    // Clear previous alerts
-    const alertDiv = document.getElementById('studentLoginAlert');
-    if (alertDiv) {
-        alertDiv.style.display = 'none';
-        alertDiv.textContent = '';
-    }
-    
-    // Basic validation
-    if (!email) {
-        showAlert('studentLoginAlert', 'Please enter your email address', 'error');
-        return;
-    }
-    
-    if (!password) {
-        showAlert('studentLoginAlert', 'Please enter your password', 'error');
-        return;
-    }
-    
-    // Email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-        showAlert('studentLoginAlert', 'Please enter a valid email address', 'error');
-        return;
-    }
-    
-    // Disable submit button to prevent multiple submissions
-    const submitBtn = e.target.querySelector('button[type="submit"]');
-    const originalText = submitBtn.innerHTML;
-    submitBtn.innerHTML = '<i class="bi bi-hourglass-split"></i> Logging in...';
-    submitBtn.disabled = true;
-    
-    try {
-        const response = await fetch(`${API_URL}/login`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password }),
-            credentials: 'include'
-        });
+            e.preventDefault();
 
-        if (response.ok) {
-            currentUser = await response.json();
+            // Get form values
+            const email = document.getElementById('studentLoginEmail').value.trim();
+            const password = document.getElementById('studentLoginPassword').value;
 
-            if (currentUser.role !== 'student') {
-                showAlert('studentLoginAlert', 'This is not a student account. Please use the correct login page.', 'error');
-                submitBtn.innerHTML = originalText;
-                submitBtn.disabled = false;
-                return;
+            // Clear previous alerts
+            const alertDiv = document.getElementById('studentLoginAlert');
+            if (alertDiv) {
+                alertDiv.style.display = 'none';
+                alertDiv.textContent = '';
             }
-            
-            if (currentUser.status === 'suspended') {
-                showAlert('studentLoginAlert', 'Your account has been suspended. Please contact the administrator.', 'error');
-                submitBtn.innerHTML = originalText;
-                submitBtn.disabled = false;
+
+            // Basic validation
+            if (!email) {
+                showAlert('studentLoginAlert', 'Please enter your email address', 'error');
                 return;
             }
 
-            // Clear the form
-            document.getElementById('studentLoginEmail').value = '';
-            document.getElementById('studentLoginPassword').value = '';
-            
-            // Hide alert if successful
-            showAlert('studentLoginAlert', '', 'error');
-            
-            // Show dashboard
-            document.getElementById('authPage').style.display = 'none';
-            document.getElementById('studentDashboard').classList.add('active');
-            document.getElementById('studentName').textContent =
-                `${currentUser.first_name} ${currentUser.last_name}`;
-            
-            loadStudentData();
-            showToast('Login successful! Welcome back!', 'success');
-            
-        } else {
-            const errorData = await response.json();
-            let errorMessage = 'Login failed';
-            
-            if (errorData.error) {
-                errorMessage = errorData.error;
-            } else if (response.status === 401) {
-                errorMessage = 'Invalid email or password';
-            } else if (response.status === 404) {
-                errorMessage = 'Account not found';
-            } else if (response.status >= 500) {
-                errorMessage = 'Server error. Please try again later.';
+            if (!password) {
+                showAlert('studentLoginAlert', 'Please enter your password', 'error');
+                return;
             }
-            
-            showAlert('studentLoginAlert', errorMessage, 'error');
-            submitBtn.innerHTML = originalText;
-            submitBtn.disabled = false;
+
+            // Email validation
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(email)) {
+                showAlert('studentLoginAlert', 'Please enter a valid email address', 'error');
+                return;
+            }
+
+            // Disable submit button to prevent multiple submissions
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            const originalText = submitBtn.innerHTML;
+            submitBtn.innerHTML = '<i class="bi bi-hourglass-split"></i> Logging in...';
+            submitBtn.disabled = true;
+
+            try {
+                const response = await fetch(`${API_URL}/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password }),
+                    credentials: 'include'
+                });
+
+                if (response.ok) {
+                    currentUser = await response.json();
+
+                    if (currentUser.role !== 'student') {
+                        showAlert('studentLoginAlert', 'This is not a student account. Please use the correct login page.', 'error');
+                        submitBtn.innerHTML = originalText;
+                        submitBtn.disabled = false;
+                        return;
+                    }
+
+                    if (currentUser.status === 'suspended') {
+                        showAlert('studentLoginAlert', 'Your account has been suspended. Please contact the administrator.', 'error');
+                        submitBtn.innerHTML = originalText;
+                        submitBtn.disabled = false;
+                        return;
+                    }
+
+                    // Clear the form
+                    document.getElementById('studentLoginEmail').value = '';
+                    document.getElementById('studentLoginPassword').value = '';
+
+                    // Hide alert if successful
+                    showAlert('studentLoginAlert', '', 'error');
+
+                    // Show dashboard
+                    document.getElementById('authPage').style.display = 'none';
+                    document.getElementById('studentDashboard').classList.add('active');
+                    document.getElementById('studentName').textContent =
+                        `${currentUser.first_name} ${currentUser.last_name}`;
+
+                    loadStudentData();
+                    showToast('Login successful! Welcome back!', 'success');
+
+                } else {
+                    const errorData = await response.json();
+                    let errorMessage = 'Login failed';
+
+                    if (errorData.error) {
+                        errorMessage = errorData.error;
+                    } else if (response.status === 401) {
+                        errorMessage = 'Invalid email or password';
+                    } else if (response.status === 404) {
+                        errorMessage = 'Account not found';
+                    } else if (response.status >= 500) {
+                        errorMessage = 'Server error. Please try again later.';
+                    }
+
+                    showAlert('studentLoginAlert', errorMessage, 'error');
+                    submitBtn.innerHTML = originalText;
+                    submitBtn.disabled = false;
+                }
+            } catch (error) {
+                console.error('Login error:', error);
+                showAlert('studentLoginAlert', 'Network error. Please check your internet connection and try again.', 'error');
+                submitBtn.innerHTML = originalText;
+                submitBtn.disabled = false;
+            }
         }
-    } catch (error) {
-        console.error('Login error:', error);
-        showAlert('studentLoginAlert', 'Network error. Please check your internet connection and try again.', 'error');
-        submitBtn.innerHTML = originalText;
-        submitBtn.disabled = false;
-    }
-}
 
-function showAlert(alertId, message, type = 'error') {
-    const alertDiv = document.getElementById(alertId);
-    if (alertDiv) {
-        alertDiv.textContent = message;
-        alertDiv.className = `alert alert-${type}`;
-        alertDiv.style.display = 'block';
-        
-        // Hide after 5 seconds
-        setTimeout(() => {
-            alertDiv.style.display = 'none';
-            alertDiv.textContent = '';
-        }, 5000);
-    }
-}
+        function showAlert(alertId, message, type = 'error') {
+            const alertDiv = document.getElementById(alertId);
+            if (alertDiv) {
+                alertDiv.textContent = message;
+                alertDiv.className = `alert alert-${type}`;
+                alertDiv.style.display = 'block';
+
+                // Hide after 5 seconds
+                setTimeout(() => {
+                    alertDiv.style.display = 'none';
+                    alertDiv.textContent = '';
+                }, 5000);
+            }
+        }
 
         async function handleTeacherLogin(e) {
             e.preventDefault();
@@ -6317,133 +6317,97 @@ function showAlert(alertId, message, type = 'error') {
             }
         }
 
-        async function editCourse(courseId) {
-    try {
-        // Make sure courseId is properly formatted
-        const response = await fetch(`${API_URL}/admin/courses/${courseId}`, {  // Changed endpoint
-            credentials: 'include'
-        });
-
-        if (!response.ok) {
-            const error = await response.json();
-            showToast(error.error || 'Failed to load course details', 'error');
-            return;
-        }
-
-        const course = await response.json();
-
-        // Populate the form fields
-        document.getElementById('adminCourseId').value = course.id;
-        document.getElementById('adminCourseTitle').value = course.title;
-        document.getElementById('adminCourseCode').value = course.course_code;
-        document.getElementById('adminCourseCredits').value = course.credits;
-        document.getElementById('adminCourseDescription').value = course.description || '';
-        document.getElementById('adminCourseTeacherLock').value = course.teacher_lock ? '1' : '0';
-        
-        // Set department and level if they exist in the form
-        const departmentSelect = document.getElementById('adminCourseDepartment');
-        const levelSelect = document.getElementById('adminCourseLevel');
-        
-        if (departmentSelect && course.department) {
-            departmentSelect.value = course.department;
-        }
-        
-        if (levelSelect && course.level) {
-            levelSelect.value = course.level;
-        }
-
-        // Update modal title
-        document.querySelector('#createCourseModal h3').textContent = 'Edit Course';
-        
-        // Store course ID in a data attribute
-        const modal = document.getElementById('createCourseModal');
-        modal.setAttribute('data-course-id', course.id);
-
-        // Update form submit handler
-        const form = document.querySelector('#createCourseModal form');
-        form.onsubmit = function(e) {
-            e.preventDefault();
-            updateCourse(e, course.id);
-        };
-
-        // Show modal
-        document.getElementById('createCourseModal').classList.add('active');
-    } catch (error) {
-        console.error('Error loading course:', error);
-        showToast('Network error. Please try again.', 'error');
-    }
-}
-
-        async function updateCourse(e, courseId) {
-    e.preventDefault();
-
-    // Get course ID from parameter or modal attribute
-    const courseIdToUpdate = courseId || document.getElementById('createCourseModal').getAttribute('data-course-id');
-    
-    if (!courseIdToUpdate) {
-        showToast('Course ID not found', 'error');
-        return;
-    }
-
-    const data = {
-        title: document.getElementById('adminCourseTitle').value,
-        course_code: document.getElementById('adminCourseCode').value,
-        credits: parseInt(document.getElementById('adminCourseCredits').value),
-        description: document.getElementById('adminCourseDescription').value,
-        teacher_lock: parseInt(document.getElementById('adminCourseTeacherLock').value),
-        status: 'active'
-    };
-
-    // Add department and level if they exist
-    const departmentSelect = document.getElementById('adminCourseDepartment');
-    const levelSelect = document.getElementById('adminCourseLevel');
-    
-    if (departmentSelect && departmentSelect.value) {
-        data.department = departmentSelect.value;
-    }
-    
-    if (levelSelect && levelSelect.value) {
-        data.level = levelSelect.value;
-    }
-
-    try {
-        const response = await fetch(`${API_URL}/admin/courses/${courseIdToUpdate}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(data),
-            credentials: 'include'
-        });
-
-        const result = await response.json();
-
-        if (response.ok) {
-            closeModal('createCourseModal');
-            loadAllCoursesForAdmin();
-            showToast('Course updated successfully!', 'success');
-
-            // Reset modal for next use
-            document.querySelector('#createCourseModal h3').textContent = 'Create New Course';
-            const form = document.querySelector('#createCourseModal form');
-            form.onsubmit = adminCreateCourse;
+        function showCreateCourseModal() {
             document.getElementById('createCourseModal').removeAttribute('data-course-id');
-            
-            // Clear form fields
+            document.getElementById('adminCourseId').value = '';
             document.getElementById('adminCourseTitle').value = '';
             document.getElementById('adminCourseCode').value = '';
             document.getElementById('adminCourseCredits').value = '';
             document.getElementById('adminCourseDescription').value = '';
             document.getElementById('adminCourseTeacherLock').value = '1';
-            
+
+            // Reset department and level
+            const departmentSelect = document.getElementById('adminCourseDepartment');
+            const levelSelect = document.getElementById('adminCourseLevel');
             if (departmentSelect) departmentSelect.value = 'all';
             if (levelSelect) levelSelect.value = 'all';
-        } else {
-            showToast(result.error || 'Failed to update course', 'error');
+
+            document.querySelector('#createCourseModal h3').textContent = 'Create New Course';
+            const form = document.querySelector('#createCourseModal form');
+            form.onsubmit = adminCreateCourse;
+            document.getElementById('createCourseModal').classList.add('active');
         }
-    } catch (error) {
-        console.error('Error updating course:', error);
-        showToast('Network error. Please try again.', 'error');
-    }
-}
+
+        async function updateCourse(e, courseId) {
+            e.preventDefault();
+
+            // Get course ID from parameter or modal attribute
+            const courseIdToUpdate = courseId || document.getElementById('createCourseModal').getAttribute('data-course-id');
+
+            if (!courseIdToUpdate) {
+                showToast('Course ID not found', 'error');
+                return;
+            }
+
+            const data = {
+                title: document.getElementById('adminCourseTitle').value,
+                course_code: document.getElementById('adminCourseCode').value,
+                credits: parseInt(document.getElementById('adminCourseCredits').value),
+                description: document.getElementById('adminCourseDescription').value,
+                teacher_lock: parseInt(document.getElementById('adminCourseTeacherLock').value),
+                status: 'active'
+            };
+
+            // Add department and level if they exist
+            const departmentSelect = document.getElementById('adminCourseDepartment');
+            const levelSelect = document.getElementById('adminCourseLevel');
+
+            if (departmentSelect && departmentSelect.value) {
+                data.department = departmentSelect.value;
+            }
+
+            if (levelSelect && levelSelect.value) {
+                data.level = levelSelect.value;
+            }
+
+            try {
+                const response = await fetch(`${API_URL}/admin/courses/${courseIdToUpdate}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data),
+                    credentials: 'include'
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    closeModal('createCourseModal');
+                    loadAllCoursesForAdmin();
+                    showToast('Course updated successfully!', 'success');
+
+                    // Reset modal for next use
+                    document.querySelector('#createCourseModal h3').textContent = 'Create New Course';
+                    const form = document.querySelector('#createCourseModal form');
+                    form.onsubmit = adminCreateCourse;
+                    document.getElementById('createCourseModal').removeAttribute('data-course-id');
+
+                    // Clear form fields
+                    document.getElementById('adminCourseTitle').value = '';
+                    document.getElementById('adminCourseCode').value = '';
+                    document.getElementById('adminCourseCredits').value = '';
+                    document.getElementById('adminCourseDescription').value = '';
+                    document.getElementById('adminCourseTeacherLock').value = '1';
+
+                    if (departmentSelect) departmentSelect.value = 'all';
+                    if (levelSelect) levelSelect.value = 'all';
+                } else {
+                    showToast(result.error || 'Failed to update course', 'error');
+                }
+            } catch (error) {
+                console.error('Error updating course:', error);
+                showToast('Network error. Please try again.', 'error');
+            }
+        }
 
         async function deleteCourse(courseId) {
             showDeleteConfirmation(

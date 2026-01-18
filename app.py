@@ -1956,6 +1956,30 @@ def admin_update_course(course_id):
                 return jsonify({'message': 'Course deleted successfully'})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
+        
+@app.route('/api/courses/<course_id>/admin-details', methods=['GET'])
+@admin_required
+def get_course_admin_details(course_id):
+    try:
+        db = get_db()
+        course = db.courses.find_one({'_id': ObjectId(course_id)})
+        
+        if not course:
+            return jsonify({'error': 'Course not found'}), 404
+        
+        # Get teacher info
+        teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
+        teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
+        teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
+        course['teacher_names'] = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers])
+        
+        # Get enrollment count
+        enrollment_count = db.enrollments.count_documents({'course_id': course['_id']})
+        course['enrollment_count'] = enrollment_count
+        
+        return jsonify(serialize_doc(course))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/compulsory-courses', methods=['GET', 'POST', 'PUT'])
 @admin_required
