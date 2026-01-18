@@ -11,9 +11,9 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from bson.json_util import dumps, loads
-from urllib.parse import quote_plus  # Added for password encoding
-from dotenv import load_dotenv  # Added for environment variables
-from pymongo.server_api import ServerApi  # Added for Server API
+from urllib.parse import quote_plus
+from dotenv import load_dotenv
+import ssl  # Added for SSL context
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,41 +31,65 @@ CORS(app, supports_credentials=True,
      methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
      expose_headers=['Set-Cookie'])
 
-# MongoDB connection with password encoding
+# MongoDB connection with password encoding - UPDATED VERSION
 def get_mongo_uri():
     # Try environment variable first (for Vercel)
     env_uri = os.environ.get('MONGO_URI')
     if env_uri:
         return env_uri
     
-    # Fallback for local development - Updated with TLS settings
+    # Fallback for local development - SIMPLIFIED CONNECTION STRING
     username = "School_Lms"
     password = "gwrNKQH7KPPpK"
     encoded_password = quote_plus(password)
-    return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database?retryWrites=true&w=majority&appName=Cluster0&tls=true&tlsAllowInvalidCertificates=false"
+    # Removed all extra parameters
+    return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database"
 
 DATABASE_NAME = 'lms_database'
 
 def get_db():
     if 'db' not in g:
         MONGO_URI = get_mongo_uri()
-        # Updated connection with explicit TLS settings
-        g.client = MongoClient(
-            MONGO_URI,
-            serverSelectionTimeoutMS=10000,  # Increased timeout
-            tls=True,
-            tlsAllowInvalidCertificates=False,
-            server_api=ServerApi('1')  # Added Server API
-        )
-        g.db = g.client[DATABASE_NAME]
-        
-        # Test connection immediately
         try:
+            # Create a custom SSL context
+            ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Connect with SSL context
+            g.client = MongoClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=15000,
+                ssl=True,
+                ssl_cert_reqs=ssl.CERT_NONE,  # Don't require certificate validation
+                connectTimeoutMS=10000,
+                socketTimeoutMS=10000,
+                maxPoolSize=50
+            )
+            g.db = g.client[DATABASE_NAME]
+            
+            # Test connection
             g.client.admin.command('ping')
             print("✅ MongoDB connected successfully!")
+            
         except Exception as e:
             print(f"❌ MongoDB connection failed: {e}")
-            raise
+            # Try alternative connection without SSL
+            try:
+                print("⚠️ Trying alternative connection without SSL...")
+                g.client = MongoClient(
+                    MONGO_URI,
+                    serverSelectionTimeoutMS=15000,
+                    ssl=False,  # Try without SSL
+                    connectTimeoutMS=10000,
+                    socketTimeoutMS=10000
+                )
+                g.db = g.client[DATABASE_NAME]
+                g.client.admin.command('ping')
+                print("✅ MongoDB connected without SSL!")
+            except Exception as e2:
+                print(f"❌ Alternative connection also failed: {e2}")
+                raise Exception(f"MongoDB connection failed: {e2}")
     
     return g.db
 
@@ -177,7 +201,7 @@ def init_db():
             db.command('ping')
             print("✅ MongoDB connected successfully!")
             
-            # Create indexes
+            # Create indexes (same as before)
             db.users.create_index([('email', ASCENDING)], unique=True)
             db.users.create_index([('teacher_code', ASCENDING)], unique=True, sparse=True)
             db.users.create_index([('student_id', ASCENDING)], unique=True, sparse=True)
@@ -189,6 +213,7 @@ def init_db():
             db.courses.create_index([('status', ASCENDING)])
             db.courses.create_index([('is_compulsory', ASCENDING)])
             
+            # ... rest of your indexes remain the same ...
             db.teacher_courses.create_index([('teacher_id', ASCENDING), ('course_id', ASCENDING)], unique=True)
             db.teacher_courses.create_index([('teacher_id', ASCENDING)])
             db.teacher_courses.create_index([('course_id', ASCENDING)])
@@ -537,9 +562,6 @@ def check_session():
         })
     return jsonify({'logged_in': False})
 
-# Course routes - REST OF THE CODE CONTINUES EXACTLY AS YOU HAVE IT...
-# [All your other routes remain exactly the same - they are already correct]
-
 # Health check route
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -564,11 +586,62 @@ def health_check():
 def debug_info():
     return jsonify({
         'mongo_uri_exists': 'MONGO_URI' in os.environ,
-        'mongo_uri_length': len(os.environ.get('MONGO_URI', '')) if 'MONGO_URI' in os.environ else 0,
-        'python_version': os.environ.get('PYTHON_VERSION', 'Not set'),
+        'python_version': os.sys.version,
         'vercel': 'VERCEL' in os.environ,
-        'vercel_env': os.environ.get('VERCEL_ENV', 'Not set')
+        'vercel_env': os.environ.get('VERCEL_ENV', 'Not set'),
+        'all_env_vars': {k: '***' if 'PASSWORD' in k or 'KEY' in k or 'SECRET' in k else v 
+                        for k, v in os.environ.items() if not k.startswith('_')}
     })
+
+# Test MongoDB connection specifically
+@app.route('/api/test-db', methods=['GET'])
+def test_db():
+    try:
+        from pymongo import MongoClient
+        import ssl
+        
+        # Simple test connection
+        username = "School_Lms"
+        password = "gwrNKQH7KPPpK"
+        encoded_password = quote_plus(password)
+        test_uri = f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/test?retryWrites=true&w=majority"
+        
+        # Try multiple connection methods
+        results = []
+        
+        # Method 1: With SSL but no cert verification
+        try:
+            client1 = MongoClient(
+                test_uri,
+                ssl=True,
+                ssl_cert_reqs=ssl.CERT_NONE,
+                serverSelectionTimeoutMS=5000
+            )
+            client1.admin.command('ping')
+            results.append("Method 1 (SSL with CERT_NONE): SUCCESS")
+            client1.close()
+        except Exception as e1:
+            results.append(f"Method 1 (SSL with CERT_NONE): FAILED - {str(e1)}")
+        
+        # Method 2: Without SSL
+        try:
+            client2 = MongoClient(
+                test_uri,
+                ssl=False,
+                serverSelectionTimeoutMS=5000
+            )
+            client2.admin.command('ping')
+            results.append("Method 2 (No SSL): SUCCESS")
+            client2.close()
+        except Exception as e2:
+            results.append(f"Method 2 (No SSL): FAILED - {str(e2)}")
+        
+        return jsonify({
+            'test_results': results,
+            'connection_string_used': test_uri.replace(password, '***')
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     init_db()
@@ -588,9 +661,10 @@ if __name__ == '__main__':
     print("   1. Mathematics")
     print("   2. English Language")
     print("   3. Data Processing")
-    print("\n🔧 Health Check:")
-    print("   🌐 http://localhost:5000/api/health")
-    print("   🐛 Debug Info: http://localhost:5000/api/debug")
+    print("\n🔧 Debug Endpoints:")
+    print("   🌐 Health: http://localhost:5000/api/health")
+    print("   🐛 Debug: http://localhost:5000/api/debug")
+    print("   🗄️  DB Test: http://localhost:5000/api/test-db")
     print("\n" + "="*60 + "\n")
     app.run(debug=True, port=5000, host='0.0.0.0', threaded=True)
 else:
