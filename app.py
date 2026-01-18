@@ -9,6 +9,7 @@ import time
 from functools import wraps
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
+from pymongo.server_api import ServerApi  # Added this
 from bson import ObjectId
 from bson.json_util import dumps, loads
 from urllib.parse import quote_plus
@@ -30,23 +31,18 @@ CORS(app, supports_credentials=True,
      methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
      expose_headers=['Set-Cookie'])
 
-# SIMPLIFIED MongoDB connection - No SSL/TLS parameters in URI
+# SIMPLE MongoDB connection using ServerApi
 def get_mongo_uri():
     # Try environment variable first (for Vercel)
     env_uri = os.environ.get('MONGO_URI')
     if env_uri:
-        # Clean any existing ssl/tls parameters from env URI
-        if 'ssl=' in env_uri or 'tls=' in env_uri:
-            # Remove ssl/tls parameters
-            import re
-            env_uri = re.sub(r'[&?](ssl|tls)=[^&]*', '', env_uri)
         return env_uri
     
-    # Clean connection string for local development
+    # SIMPLE connection string - MongoDB Atlas handles SSL automatically
     username = "School_Lms"
     password = "gwrNKQH7KPPpK"
     encoded_password = quote_plus(password)
-    # SIMPLE connection string without ssl/tls parameters
+    # Remove all SSL/TLS parameters - let MongoDB driver handle it
     return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database?retryWrites=true&w=majority"
 
 DATABASE_NAME = 'lms_database'
@@ -54,65 +50,60 @@ DATABASE_NAME = 'lms_database'
 def get_db():
     if 'db' not in g:
         MONGO_URI = get_mongo_uri()
-        print(f"🔧 Connecting with URI: {MONGO_URI[:50]}...")  # Log first 50 chars
+        print(f"🔧 Connecting to MongoDB Atlas...")
         
         try:
-            # METHOD 1: Try with SSL enabled (but not enforced)
-            print("🔄 Trying connection with SSL enabled...")
+            # Use ServerApi for stable API version
+            server_api = ServerApi('1')
+            
+            # Let PyMongo handle SSL automatically - don't specify SSL settings
             g.client = MongoClient(
                 MONGO_URI,
-                serverSelectionTimeoutMS=10000,
-                ssl=True,
-                tlsAllowInvalidCertificates=True,  # Allow invalid certs
-                connectTimeoutMS=10000,
-                socketTimeoutMS=10000,
-                retryWrites=True,
-                w='majority'
+                serverSelectionTimeoutMS=5000,
+                server_api=server_api
             )
             g.db = g.client[DATABASE_NAME]
             
             # Test connection
             g.client.admin.command('ping')
-            print("✅ MongoDB connected successfully with SSL!")
+            print("✅ MongoDB connected successfully!")
             
         except Exception as e:
-            print(f"⚠️ SSL connection failed: {e}")
+            print(f"❌ Standard connection failed: {e}")
             
-            # METHOD 2: Try without SSL
+            # ALTERNATIVE: Try with direct connection to primary
             try:
-                print("🔄 Trying connection without SSL...")
+                print("🔄 Trying alternative connection method...")
+                # Connect without ServerApi
                 g.client = MongoClient(
                     MONGO_URI,
-                    serverSelectionTimeoutMS=10000,
-                    ssl=False,  # Explicitly disable SSL
-                    connectTimeoutMS=10000,
-                    socketTimeoutMS=10000
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=5000,
+                    socketTimeoutMS=5000
                 )
                 g.db = g.client[DATABASE_NAME]
                 
                 # Test connection
                 g.client.admin.command('ping')
-                print("✅ MongoDB connected successfully without SSL!")
+                print("✅ Alternative connection successful!")
                 
             except Exception as e2:
-                print(f"❌ Non-SSL connection also failed: {e2}")
+                print(f"❌ Alternative connection failed: {e2}")
                 
-                # METHOD 3: Try minimal connection
-                try:
-                    print("🔄 Trying minimal connection...")
-                    g.client = MongoClient(
-                        MONGO_URI,
-                        serverSelectionTimeoutMS=15000
-                    )
-                    g.db = g.client[DATABASE_NAME]
-                    
-                    # Test connection
-                    g.client.admin.command('ping')
-                    print("✅ MongoDB connected with minimal settings!")
-                    
-                except Exception as e3:
-                    print(f"❌ All connection attempts failed: {e3}")
-                    raise Exception(f"MongoDB connection failed after multiple attempts: {e3}")
+                # LAST RESORT: Try to check MongoDB Atlas configuration
+                print("\n⚠️  MongoDB Connection Troubleshooting:")
+                print("1. Check MongoDB Atlas Network Access:")
+                print("   - Go to MongoDB Atlas → Security → Network Access")
+                print("   - Add IP Address 0.0.0.0/0 (Allow from anywhere)")
+                print("2. Check Database User:")
+                print("   - Go to MongoDB Atlas → Security → Database Access")
+                print("   - Ensure user 'School_Lms' has correct privileges")
+                print("3. Update PyMongo:")
+                print("   - Run: pip install pymongo[srv] --upgrade")
+                print("4. Try this connection string in MongoDB Compass:")
+                print(f"   mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database")
+                
+                raise Exception(f"MongoDB connection failed. Please check Atlas configuration: {e2}")
     
     return g.db
 
@@ -121,8 +112,6 @@ def close_db(exception=None):
     client = g.pop('client', None)
     if client is not None:
         client.close()
-
-# [REST OF YOUR CODE REMAINS EXACTLY THE SAME - ALL AUTHENTICATION DECORATORS, HELPER FUNCTIONS, ROUTES, ETC.]
 
 # Authentication decorators
 def login_required(f):
@@ -366,7 +355,7 @@ def init_db():
 def index():
     return send_from_directory('.', 'index.html')
 
-# [ALL YOUR ROUTES REMAIN EXACTLY THE SAME FROM HERE...]
+# [REST OF YOUR ROUTES - ALL THE SAME AS BEFORE]
 # Authentication routes
 @app.route('/api/register', methods=['POST'])
 def register():
