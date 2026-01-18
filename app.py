@@ -32,16 +32,16 @@ CORS(app, supports_credentials=True,
 
 # MongoDB connection with password encoding
 def get_mongo_uri():
-    # Try environment variable first
+    # Try environment variable first (for Vercel)
     env_uri = os.environ.get('MONGO_URI')
     if env_uri:
         return env_uri
     
-    # Fallback to hardcoded with encoding
+    # Fallback for local development
     username = "School_Lms"
     password = "gwrNKQH7KPPpK"
     encoded_password = quote_plus(password)
-    return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    return f"mongodb+srv://{username}:{encoded_password}@cluster0.kwfjszf.mongodb.net/lms_database?retryWrites=true&w=majority&appName=Cluster0"
 
 MONGO_URI = get_mongo_uri()
 DATABASE_NAME = 'lms_database'
@@ -564,3 +564,6 @@ if __name__ == '__main__':
     print("   🌐 http://localhost:5000/api/health")
     print("\n" + "="*60 + "\n")
     app.run(debug=True, port=5000, host='0.0.0.0', threaded=True)
+else:
+    # For Vercel deployment
+    init_db()
