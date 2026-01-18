@@ -6318,81 +6318,132 @@ function showAlert(alertId, message, type = 'error') {
         }
 
         async function editCourse(courseId) {
-            try {
-                const response = await fetch(`${API_URL}/courses/${courseId}`, {
-                    credentials: 'include'
-                });
-                const course = await response.json();
+    try {
+        // Make sure courseId is properly formatted
+        const response = await fetch(`${API_URL}/admin/courses/${courseId}`, {  // Changed endpoint
+            credentials: 'include'
+        });
 
-                if (response.ok) {
-                    document.getElementById('adminCourseId').value = course.id;
-                    document.getElementById('adminCourseTitle').value = course.title;
-                    document.getElementById('adminCourseCode').value = course.course_code;
-                    document.getElementById('adminCourseCredits').value = course.credits;
-                    document.getElementById('adminCourseDescription').value = course.description;
-                    document.getElementById('adminCourseTeacherLock').value = course.teacher_lock ? '1' : '0';
-
-                    document.querySelector('#createCourseModal h3').textContent = 'Edit Course';
-                    document.getElementById('createCourseModal').setAttribute('data-course-id', courseId);
-
-                    const form = document.querySelector('#createCourseModal form');
-                    form.onsubmit = updateCourse;
-
-                    document.getElementById('createCourseModal').classList.add('active');
-                } else {
-                    showToast('Failed to load course details', 'error');
-                }
-            } catch (error) {
-                console.error('Error loading course:', error);
-                showToast('Failed to load course details', 'error');
-            }
+        if (!response.ok) {
+            const error = await response.json();
+            showToast(error.error || 'Failed to load course details', 'error');
+            return;
         }
 
-        async function updateCourse(e) {
+        const course = await response.json();
+
+        // Populate the form fields
+        document.getElementById('adminCourseId').value = course.id;
+        document.getElementById('adminCourseTitle').value = course.title;
+        document.getElementById('adminCourseCode').value = course.course_code;
+        document.getElementById('adminCourseCredits').value = course.credits;
+        document.getElementById('adminCourseDescription').value = course.description || '';
+        document.getElementById('adminCourseTeacherLock').value = course.teacher_lock ? '1' : '0';
+        
+        // Set department and level if they exist in the form
+        const departmentSelect = document.getElementById('adminCourseDepartment');
+        const levelSelect = document.getElementById('adminCourseLevel');
+        
+        if (departmentSelect && course.department) {
+            departmentSelect.value = course.department;
+        }
+        
+        if (levelSelect && course.level) {
+            levelSelect.value = course.level;
+        }
+
+        // Update modal title
+        document.querySelector('#createCourseModal h3').textContent = 'Edit Course';
+        
+        // Store course ID in a data attribute
+        const modal = document.getElementById('createCourseModal');
+        modal.setAttribute('data-course-id', course.id);
+
+        // Update form submit handler
+        const form = document.querySelector('#createCourseModal form');
+        form.onsubmit = function(e) {
             e.preventDefault();
+            updateCourse(e, course.id);
+        };
 
-            const courseId = document.getElementById('createCourseModal').getAttribute('data-course-id');
-            if (!courseId) {
-                showToast('Course ID not found', 'error');
-                return;
-            }
+        // Show modal
+        document.getElementById('createCourseModal').classList.add('active');
+    } catch (error) {
+        console.error('Error loading course:', error);
+        showToast('Network error. Please try again.', 'error');
+    }
+}
 
-            const data = {
-                title: document.getElementById('adminCourseTitle').value,
-                course_code: document.getElementById('adminCourseCode').value,
-                credits: parseInt(document.getElementById('adminCourseCredits').value),
-                description: document.getElementById('adminCourseDescription').value,
-                teacher_lock: parseInt(document.getElementById('adminCourseTeacherLock').value),
-                status: 'active'
-            };
+        async function updateCourse(e, courseId) {
+    e.preventDefault();
 
-            try {
-                const response = await fetch(`${API_URL}/admin/courses/${courseId}`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data),
-                    credentials: 'include'
-                });
+    // Get course ID from parameter or modal attribute
+    const courseIdToUpdate = courseId || document.getElementById('createCourseModal').getAttribute('data-course-id');
+    
+    if (!courseIdToUpdate) {
+        showToast('Course ID not found', 'error');
+        return;
+    }
 
-                const result = await response.json();
+    const data = {
+        title: document.getElementById('adminCourseTitle').value,
+        course_code: document.getElementById('adminCourseCode').value,
+        credits: parseInt(document.getElementById('adminCourseCredits').value),
+        description: document.getElementById('adminCourseDescription').value,
+        teacher_lock: parseInt(document.getElementById('adminCourseTeacherLock').value),
+        status: 'active'
+    };
 
-                if (response.ok) {
-                    closeModal('createCourseModal');
-                    loadAllCoursesForAdmin();
-                    showToast('Course updated successfully!', 'success');
+    // Add department and level if they exist
+    const departmentSelect = document.getElementById('adminCourseDepartment');
+    const levelSelect = document.getElementById('adminCourseLevel');
+    
+    if (departmentSelect && departmentSelect.value) {
+        data.department = departmentSelect.value;
+    }
+    
+    if (levelSelect && levelSelect.value) {
+        data.level = levelSelect.value;
+    }
 
-                    document.querySelector('#createCourseModal h3').textContent = 'Create New Course';
-                    const form = document.querySelector('#createCourseModal form');
-                    form.onsubmit = adminCreateCourse;
-                    document.getElementById('createCourseModal').removeAttribute('data-course-id');
-                } else {
-                    showToast(result.error || 'Failed to update course', 'error');
-                }
-            } catch (error) {
-                console.error('Error updating course:', error);
-                showToast('Network error. Please try again.', 'error');
-            }
+    try {
+        const response = await fetch(`${API_URL}/admin/courses/${courseIdToUpdate}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+            credentials: 'include'
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+            closeModal('createCourseModal');
+            loadAllCoursesForAdmin();
+            showToast('Course updated successfully!', 'success');
+
+            // Reset modal for next use
+            document.querySelector('#createCourseModal h3').textContent = 'Create New Course';
+            const form = document.querySelector('#createCourseModal form');
+            form.onsubmit = adminCreateCourse;
+            document.getElementById('createCourseModal').removeAttribute('data-course-id');
+            
+            // Clear form fields
+            document.getElementById('adminCourseTitle').value = '';
+            document.getElementById('adminCourseCode').value = '';
+            document.getElementById('adminCourseCredits').value = '';
+            document.getElementById('adminCourseDescription').value = '';
+            document.getElementById('adminCourseTeacherLock').value = '1';
+            
+            if (departmentSelect) departmentSelect.value = 'all';
+            if (levelSelect) levelSelect.value = 'all';
+        } else {
+            showToast(result.error || 'Failed to update course', 'error');
         }
+    } catch (error) {
+        console.error('Error updating course:', error);
+        showToast('Network error. Please try again.', 'error');
+    }
+}
 
         async function deleteCourse(courseId) {
             showDeleteConfirmation(
