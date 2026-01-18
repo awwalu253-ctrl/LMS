@@ -594,6 +594,246 @@ def health_check():
             'error': str(e),
             'timestamp': datetime.utcnow().isoformat()
         }), 500
+        
+# Add this route to your backend
+@app.route('/api/admin/teachers', methods=['POST'])
+@admin_required
+def create_teacher_account():
+    try:
+        data = request.json
+        db = get_db()
+        
+        # Check if email already exists
+        existing_user = db.users.find_one({'email': data['email']})
+        if existing_user:
+            return jsonify({'error': 'Email already exists'}), 400
+        
+        # Check if teacher code already exists
+        existing_code = db.users.find_one({'teacher_code': data.get('teacher_code')})
+        if existing_code:
+            return jsonify({'error': 'Teacher code already exists'}), 400
+        
+        # Hash password
+        hashed_password = generate_password_hash(data['password'])
+        
+        # Create teacher document
+        teacher_data = {
+            'email': data['email'],
+            'password': hashed_password,
+            'first_name': data['first_name'],
+            'last_name': data['last_name'],
+            'role': 'teacher',
+            'teacher_code': data['teacher_code'],
+            'department': data.get('department', ''),
+            'specialization': data.get('specialization', ''),
+            'status': 'active',
+            'created_at': datetime.utcnow()
+        }
+        
+        # Add optional fields if present
+        optional_fields = ['phone', 'address', 'date_of_birth', 'gender']
+        for field in optional_fields:
+            if field in data:
+                teacher_data[field] = data[field]
+        
+        # Insert into database
+        result = db.users.insert_one(teacher_data)
+        teacher_id = str(result.inserted_id)
+        
+        return jsonify({
+            'message': 'Teacher account created successfully',
+            'teacher_id': teacher_id,
+            'teacher_code': data['teacher_code']
+        }), 201
+        
+    except DuplicateKeyError as e:
+        return jsonify({'error': 'Duplicate key error. Email or teacher code already exists.'}), 400
+    except Exception as e:
+        return jsonify({'error': f'Failed to create teacher account: {str(e)}'}), 500
+    
+# Get all teachers (admin only)
+@app.route('/api/admin/teachers', methods=['GET'])
+@admin_required
+def get_all_teachers():
+    try:
+        db = get_db()
+        
+        # Get all teachers with their course count
+        teachers = list(db.users.find({'role': 'teacher'}).sort('created_at', -1))
+        
+        # Get course counts for each teacher
+        for teacher in teachers:
+            course_count = db.teacher_courses.count_documents({'teacher_id': teacher['_id']})
+            teacher['course_count'] = course_count
+            
+            # Get assigned courses
+            teacher_courses = list(db.teacher_courses.find({'teacher_id': teacher['_id']}))
+            course_ids = [tc['course_id'] for tc in teacher_courses]
+            courses = list(db.courses.find({'_id': {'$in': course_ids}}))
+            teacher['assigned_courses'] = serialize_list(courses)
+        
+        return jsonify(serialize_list(teachers))
+    except Exception as e:
+        return jsonify({'error': f'Failed to fetch teachers: {str(e)}'}), 500
+
+# Get teacher details
+@app.route('/api/admin/teachers/<teacher_id>/details', methods=['GET'])
+@admin_required
+def get_teacher_details(teacher_id):
+    try:
+        db = get_db()
+        
+        # Get teacher info
+        teacher = db.users.find_one({'_id': ObjectId(teacher_id)})
+        if not teacher:
+            return jsonify({'error': 'Teacher not found'}), 404
+        
+        # Get assigned courses
+        teacher_courses = list(db.teacher_courses.find({'teacher_id': ObjectId(teacher_id)}))
+        course_ids = [tc['course_id'] for tc in teacher_courses]
+        courses = list(db.courses.find({'_id': {'$in': course_ids}}))
+        
+        # Get recent announcements by this teacher
+        recent_announcements = list(db.announcements.find(
+            {'teacher_id': ObjectId(teacher_id)}).sort('created_at', -1).limit(5))
+        
+        # Get recent assignments by this teacher
+        recent_assignments = list(db.assignments.find(
+            {'teacher_id': ObjectId(teacher_id)}).sort('created_at', -1).limit(5))
+        
+        return jsonify({
+            'teacher': serialize_doc(teacher),
+            'courses': serialize_list(courses),
+            'announcements': serialize_list(recent_announcements),
+            'assignments': serialize_list(recent_assignments)
+        })
+    except Exception as e:
+        return jsonify({'error': f'Failed to fetch teacher details: {str(e)}'}), 500
+
+# Update teacher account
+@app.route('/api/admin/teachers/<teacher_id>', methods=['PUT'])
+@admin_required
+def update_teacher_account(teacher_id):
+    try:
+        data = request.json
+        db = get_db()
+        
+        # Check if teacher exists
+        teacher = db.users.find_one({'_id': ObjectId(teacher_id), 'role': 'teacher'})
+        if not teacher:
+            return jsonify({'error': 'Teacher not found'}), 404
+        
+        # Update data
+        update_data = {}
+        
+        # Basic fields
+        basic_fields = ['first_name', 'last_name', 'email', 'teacher_code', 
+                       'department', 'specialization', 'phone', 'address', 
+                       'date_of_birth', 'gender', 'status']
+        
+        for field in basic_fields:
+            if field in data:
+                update_data[field] = data[field]
+        
+        # Update password if provided
+        if 'password' in data and data['password']:
+            update_data['password'] = generate_password_hash(data['password'])
+        
+        # Check for duplicate email
+        if 'email' in update_data:
+            existing_email = db.users.find_one({
+                'email': update_data['email'],
+                '_id': {'$ne': ObjectId(teacher_id)}
+            })
+            if existing_email:
+                return jsonify({'error': 'Email already in use by another user'}), 400
+        
+        # Check for duplicate teacher code
+        if 'teacher_code' in update_data:
+            existing_code = db.users.find_one({
+                'teacher_code': update_data['teacher_code'],
+                '_id': {'$ne': ObjectId(teacher_id)}
+            })
+            if existing_code:
+                return jsonify({'error': 'Teacher code already in use by another teacher'}), 400
+        
+        # Update teacher
+        db.users.update_one(
+            {'_id': ObjectId(teacher_id)},
+            {'$set': update_data}
+        )
+        
+        return jsonify({'message': 'Teacher account updated successfully'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to update teacher: {str(e)}'}), 500
+
+# Delete teacher account
+@app.route('/api/admin/teachers/<teacher_id>', methods=['DELETE'])
+@admin_required
+def delete_teacher_account(teacher_id):
+    try:
+        db = get_db()
+        
+        # Check if teacher exists
+        teacher = db.users.find_one({'_id': ObjectId(teacher_id), 'role': 'teacher'})
+        if not teacher:
+            return jsonify({'error': 'Teacher not found'}), 404
+        
+        # Remove teacher from all courses
+        db.teacher_courses.delete_many({'teacher_id': ObjectId(teacher_id)})
+        
+        # Delete teacher account
+        db.users.delete_one({'_id': ObjectId(teacher_id)})
+        
+        return jsonify({'message': 'Teacher account deleted successfully'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to delete teacher: {str(e)}'}), 500
+    
+@app.route('/api/teacher-login', methods=['POST'])
+def teacher_login():
+    try:
+        data = request.json
+        db = get_db()
+        
+        # Find teacher by email
+        user = db.users.find_one({
+            'email': data['email'],
+            'role': 'teacher'
+        })
+        
+        if user and check_password_hash(user['password'], data['password']):
+            if user['status'] == 'suspended':
+                return jsonify({'error': 'Your account has been suspended. Please contact administrator.'}), 403
+            
+            # REMOVE THIS CHECK for teacher code during login
+            # if user['teacher_code'] != data.get('teacher_code'):
+            #     return jsonify({'error': 'Invalid teacher code'}), 401
+            
+            teacher_courses = list(db.teacher_courses.find(
+                {'teacher_id': user['_id']},
+                {'course_id': 1}
+            ))
+            
+            course_ids = [tc['course_id'] for tc in teacher_courses]
+            courses = list(db.courses.find({'_id': {'$in': course_ids}}))
+            
+            session['user_id'] = str(user['_id'])
+            session['role'] = user['role']
+            session.permanent = True
+            return jsonify({
+                'id': str(user['_id']),
+                'email': user['email'],
+                'first_name': user['first_name'],
+                'last_name': user['last_name'],
+                'role': user['role'],
+                'teacher_code': user.get('teacher_code', ''),
+                'teacher_id': str(user['_id']),
+                'assigned_courses': serialize_list(courses)
+            })
+        
+        return jsonify({'error': 'Invalid credentials'}), 401
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 if __name__ == '__main__':
     init_db()
