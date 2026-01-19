@@ -14,9 +14,6 @@ from bson import ObjectId
 from bson.json_util import dumps, loads
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
-import json
-from datetime import datetime
-from bson import ObjectId
 
 # Load environment variables from .env file
 load_dotenv()
@@ -1977,43 +1974,29 @@ def admin_update_course(course_id):
                 return jsonify({'message': 'Course deleted successfully'})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
-        
+
 @app.route('/api/courses/<course_id>/admin-details', methods=['GET'])
 @admin_required
 def get_course_admin_details(course_id):
     try:
         print(f"=== GET COURSE ADMIN DETAILS ===")
         print(f"Course ID received: {course_id}")
-        print(f"Type of course_id: {type(course_id)}")
         
         db = get_db()
         
-        # First, try to find by string ID field (if courses have an 'id' field)
-        course = db.courses.find_one({'id': course_id})
-        
-        # If not found by string ID, try ObjectId
-        if not course:
-            try:
-                obj_id = ObjectId(course_id)
-                course = db.courses.find_one({'_id': obj_id})
-            except:
-                print(f"Failed to convert to ObjectId: {course_id}")
-                # Try as integer ID
-                try:
-                    course = db.courses.find_one({'id': int(course_id)})
-                except:
-                    pass
+        # Try to find by ObjectId
+        try:
+            obj_id = ObjectId(course_id)
+            course = db.courses.find_one({'_id': obj_id})
+        except:
+            print(f"Failed to convert to ObjectId: {course_id}")
+            course = None
         
         if not course:
-            print(f"Course not found with any ID method: {course_id}")
-            # Try one more time - look for any course to debug
-            all_courses = list(db.courses.find().limit(5))
-            print(f"First 5 courses in DB: {[(str(c['_id']), c.get('title')) for c in all_courses]}")
+            print(f"Course not found: {course_id}")
             return jsonify({'error': 'Course not found'}), 404
         
         print(f"Course found: {course.get('title')}")
-        print(f"Course _id: {course.get('_id')}")
-        print(f"Course id field: {course.get('id')}")
         
         # Get teacher info
         teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
@@ -2027,7 +2010,6 @@ def get_course_admin_details(course_id):
         
         # Serialize the course
         serialized_course = serialize_doc(course)
-        print(f"Serialized course keys: {serialized_course.keys()}")
         
         return jsonify(serialized_course)
         
@@ -2037,7 +2019,7 @@ def get_course_admin_details(course_id):
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
-    
+
 @app.route('/api/admin/compulsory-courses', methods=['GET', 'POST', 'PUT'])
 @admin_required
 def admin_compulsory_courses():
@@ -2100,7 +2082,10 @@ def admin_compulsory_courses():
                     })
                 
                 if enrollments:
-                    db.enrollments.insert_many(enrollments, ordered=False)
+                    try:
+                        db.enrollments.insert_many(enrollments, ordered=False)
+                    except:
+                        pass  # Some students might already be enrolled
                 
                 return jsonify({
                     'message': f'Compulsory course created and {len(students)} students auto-enrolled',
@@ -2278,8 +2263,11 @@ def admin_deploy_department_courses():
                             'course_id': course_id,
                             'enrolled_at': datetime.utcnow()
                         }
-                        db.enrollments.insert_one(enrollment)
-                        auto_enrolled_count += 1
+                        try:
+                            db.enrollments.insert_one(enrollment)
+                            auto_enrolled_count += 1
+                        except:
+                            pass  # Student might already be enrolled
             
             deployed_courses.append(course_data['title'])
         
