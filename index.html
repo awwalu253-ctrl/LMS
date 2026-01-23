@@ -1331,11 +1331,23 @@
             /* Centers the image */
             background-position: center;
 
+            height: 1000;
+
             /* Basic text styling so you can see your content */
             color: white;
             font-family: Arial, sans-serif;
             margin: 0;
             height: 100vh;
+        }
+
+        .switchs-auth-1{
+            margin-top: 10px;
+            margin-left: -20px;
+            font-family: 'Franklin Gothic Medium', 'Arial Narrow', Arial, sans-serif
+        }
+
+        .switchs-auth-1 a{
+            text-decoration: none;
         }
     </style>
 </head>
@@ -1362,7 +1374,7 @@
                         <i class="bi bi-shield-lock"></i> Admin Login
                     </button>
                 </div>
-                <div class="switch-auth">
+                <div class="switch-auth-1">
                     <span style="color: black;">Don't have an account? </span>
                     <a href="#" onclick="showRegister()">Register here</a>
                 </div>
@@ -1509,8 +1521,8 @@
                     </div>
                     <button type="submit" class="btn">Register</button>
                 </form>
-                <div class="switch-auth">
-                    Already have an account? <a href="#" onclick="showLogin()">Login here</a>
+                <div class="switchs-auth-1">
+                    <span class="log" style="color: black;">Already have an account?</span> <a href="#" onclick="showLogin()">Login here</a>
                 </div>
             </div>
 
