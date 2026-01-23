@@ -6,6 +6,9 @@ import secrets
 import os
 import json
 import time
+import sys
+import logging
+import signal
 from functools import wraps
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
@@ -18,15 +21,33 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Validate required environment variables
+required_env_vars = []
+for var in required_env_vars:
+    if not os.environ.get(var):
+        logger.warning(f"⚠️ Warning: {var} not set in environment")
+
 app = Flask(__name__, static_folder='.')
 app.secret_key = secrets.token_hex(32)
 app.config['PERMANENT_SESSION_LIFETIME'] = 3600
-app.config['SESSION_COOKIE_SECURE'] = False
+app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production with HTTPS
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
+# Configure CORS
+cors_origins = ['http://localhost:5000', 'http://127.0.0.1:5000']
+if os.environ.get('ALLOWED_ORIGINS'):
+    cors_origins.extend(os.environ.get('ALLOWED_ORIGINS').split(','))
+
 CORS(app, supports_credentials=True, 
-     origins=['http://localhost:5000', 'http://127.0.0.1:5000'],
+     origins=cors_origins,
      allow_headers=['Content-Type', 'Authorization', 'X-Requested-With'],
      methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
      expose_headers=['Set-Cookie'])
@@ -47,7 +68,7 @@ DATABASE_NAME = 'lms_database'
 def get_db():
     if 'db' not in g:
         MONGO_URI = get_mongo_uri()
-        print(f"🔧 Connecting to MongoDB Atlas...")
+        logger.info("🔧 Connecting to MongoDB Atlas...")
         
         try:
             server_api = ServerApi('1')
@@ -58,12 +79,12 @@ def get_db():
             )
             g.db = g.client[DATABASE_NAME]
             g.client.admin.command('ping')
-            print("✅ MongoDB connected successfully!")
+            logger.info("✅ MongoDB connected successfully!")
             
         except Exception as e:
-            print(f"❌ Standard connection failed: {e}")
+            logger.error(f"❌ Standard connection failed: {e}")
             try:
-                print("🔄 Trying alternative connection method...")
+                logger.info("🔄 Trying alternative connection method...")
                 g.client = MongoClient(
                     MONGO_URI,
                     serverSelectionTimeoutMS=5000,
@@ -72,19 +93,29 @@ def get_db():
                 )
                 g.db = g.client[DATABASE_NAME]
                 g.client.admin.command('ping')
-                print("✅ Alternative connection successful!")
+                logger.info("✅ Alternative connection successful!")
                 
             except Exception as e2:
-                print(f"❌ Alternative connection failed: {e2}")
+                logger.error(f"❌ Alternative connection failed: {e2}")
                 raise Exception(f"MongoDB connection failed: {e2}")
     
     return g.db
+
+def get_db_with_pool():
+    """Alternative connection with connection pooling"""
+    if 'db_pool' not in g:
+        MONGO_URI = get_mongo_uri()
+        g.db_pool = MongoClient(MONGO_URI, maxPoolSize=50)
+    return g.db_pool[DATABASE_NAME]
 
 @app.teardown_appcontext
 def close_db(exception=None):
     client = g.pop('client', None)
     if client is not None:
         client.close()
+    # Also clean up connection pool if used
+    if 'db_pool' in g:
+        g.pop('db_pool', None)
 
 # Authentication decorators
 def login_required(f):
@@ -201,10 +232,10 @@ def auto_enroll_compulsory_courses(db, student_id, level, department=None):
             except:
                 pass
         
-        print(f"✅ Auto-enrolled student {student_id} in {len(compulsory_courses)} compulsory courses for level {level}")
+        logger.info(f"✅ Auto-enrolled student {student_id} in {len(compulsory_courses)} compulsory courses for level {level}")
         
     except Exception as e:
-        print(f"⚠️ Error auto-enrolling student: {e}")
+        logger.warning(f"⚠️ Error auto-enrolling student: {e}")
 
 def create_notification(db, user_id, title, message, notification_type='info', reference_id=None):
     notification = {
@@ -218,12 +249,29 @@ def create_notification(db, user_id, title, message, notification_type='info', r
     }
     db.notifications.insert_one(notification)
 
+def check_fee_payment_status(db, student_id):
+    """Check if student's fees have been approved"""
+    student = db.users.find_one({'_id': ObjectId(student_id), 'role': 'student'})
+    if not student:
+        return False
+    
+    # Check if fee payment is required for this student
+    if student.get('fee_payment_required', True):
+        # Check if there's an approved fee payment
+        fee_payment = db.fee_payments.find_one({
+            'student_id': ObjectId(student_id),
+            'status': 'approved'
+        })
+        return fee_payment is not None
+    
+    return True  # If fee payment not required, allow access
+
 def init_db():
     with app.app_context():
         try:
             db = get_db()
             db.command('ping')
-            print("✅ MongoDB connected successfully!")
+            logger.info("✅ MongoDB connected successfully!")
             
             # Create indexes
             db.users.create_index([('email', ASCENDING)], unique=True)
@@ -278,6 +326,19 @@ def init_db():
             db.course_approval_requests.create_index([('course_id', ASCENDING)])
             db.course_approval_requests.create_index([('requested_at', DESCENDING)])
             
+            # Fee payments indexes
+            db.fee_payments.create_index([('student_id', ASCENDING)])
+            db.fee_payments.create_index([('status', ASCENDING)])
+            db.fee_payments.create_index([('payment_date', DESCENDING)])
+            db.fee_payments.create_index([('receipt_number', ASCENDING)], unique=True)
+            db.fee_payments.create_index([('academic_year', ASCENDING), ('semester', ASCENDING)])
+            
+            # Fee structures indexes
+            db.fee_structures.create_index([('level', ASCENDING)])
+            db.fee_structures.create_index([('department', ASCENDING)])
+            db.fee_structures.create_index([('academic_year', ASCENDING)])
+            db.fee_structures.create_index([('semester', ASCENDING)])
+            
             # Create admin user
             if not db.users.find_one({'email': 'admin@school.edu'}):
                 db.users.insert_one({
@@ -289,7 +350,7 @@ def init_db():
                     'status': 'active',
                     'created_at': datetime.utcnow()
                 })
-                print("✅ Admin user created")
+                logger.info("✅ Admin user created")
             
             # Create teacher user
             if not db.users.find_one({'email': 'teacher@school.edu'}):
@@ -303,7 +364,7 @@ def init_db():
                     'status': 'active',
                     'created_at': datetime.utcnow()
                 })
-                print("✅ Teacher user created")
+                logger.info("✅ Teacher user created")
             
             # Create initial courses
             if db.courses.count_documents({}) == 0:
@@ -355,10 +416,10 @@ def init_db():
                             'created_at': datetime.utcnow()
                         })
                 
-                print("✅ Database initialized with compulsory courses for each level!")
+                logger.info("✅ Database initialized with compulsory courses for each level!")
                 
         except Exception as e:
-            print(f"❌ Database initialization error: {e}")
+            logger.error(f"❌ Database initialization error: {e}")
 
 # ==============================================
 # MAIN ROUTES
@@ -386,6 +447,8 @@ def register():
                 return jsonify({'error': 'Department is required for High School students'}), 400
             
             data['student_id'] = generate_student_id(db)
+            # Set fee payment required to True by default for new students
+            data['fee_payment_required'] = True
         
         if data['role'] == 'teacher':
             existing_code = db.users.find_one({'teacher_code': data.get('teacher_code')})
@@ -405,7 +468,8 @@ def register():
         }
         
         optional_fields = ['student_id', 'phone', 'address', 'date_of_birth', 
-                          'gender', 'department', 'level', 'teacher_code', 'specialization']
+                          'gender', 'department', 'level', 'teacher_code', 
+                          'specialization', 'fee_payment_required']
         for field in optional_fields:
             if field in data and data[field]:
                 user_data[field] = data[field]
@@ -428,6 +492,7 @@ def register():
             return jsonify({'error': 'Teacher code already exists'}), 400
         return jsonify({'error': 'Registration failed'}), 400
     except Exception as e:
+        logger.error(f"Registration error: {e}")
         return jsonify({'error': f'Database error: {str(e)}'}), 500
 
 @app.route('/api/login', methods=['POST'])
@@ -442,6 +507,30 @@ def login():
             if user['status'] == 'suspended':
                 return jsonify({'error': 'Your account has been suspended. Please contact administrator.'}), 403
             
+            # Check fee payment for students
+            if user['role'] == 'student':
+                # Get all fee payments for student
+                fee_payments = list(db.fee_payments.find({
+                    'student_id': user['_id']
+                }))
+                
+                # Check if there's an approved payment
+                has_approved_payment = any(p['status'] == 'approved' for p in fee_payments)
+                
+                # Check if fee payment is required
+                fee_payment_required = user.get('fee_payment_required', True)
+                
+                # Student can access if: no fee required OR has approved payment
+                can_access_courses = not fee_payment_required or has_approved_payment
+                
+                if not can_access_courses:
+                    return jsonify({
+                        'error': 'Fee payment pending approval',
+                        'requires_fee_approval': True,
+                        'student_id': str(user['_id']),
+                        'message': 'Please wait for fee payment approval to access courses. You can still access the fee payment section.'
+                    }), 403
+            
             if data.get('role') == 'student' and user['role'] != 'student':
                 return jsonify({'error': 'Invalid student account'}), 401
             
@@ -452,10 +541,24 @@ def login():
             user_data = serialize_doc(user)
             user_data.pop('password', None)
             
+            # Add fee payment status for students
+            if user['role'] == 'student':
+                fee_payments = list(db.fee_payments.find({
+                    'student_id': user['_id']
+                }))
+                has_approved_payment = any(p['status'] == 'approved' for p in fee_payments)
+                fee_payment_required = user.get('fee_payment_required', True)
+                
+                user_data['has_approved_fee_payment'] = has_approved_payment
+                user_data['fee_payment_required'] = fee_payment_required
+                user_data['can_access_courses'] = not fee_payment_required or has_approved_payment
+                user_data['pending_fee_approval'] = fee_payment_required and not has_approved_payment
+            
             return jsonify(user_data)
         
         return jsonify({'error': 'Invalid credentials'}), 401
     except Exception as e:
+        logger.error(f"Login error: {e}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/teacher-login', methods=['POST'])
@@ -498,6 +601,7 @@ def teacher_login():
         
         return jsonify({'error': 'Invalid credentials'}), 401
     except Exception as e:
+        logger.error(f"Teacher login error: {e}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/admin-login', methods=['POST'])
@@ -523,6 +627,7 @@ def admin_login():
         
         return jsonify({'error': 'Invalid admin credentials'}), 401
     except Exception as e:
+        logger.error(f"Admin login error: {e}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/logout', methods=['POST'])
@@ -533,9 +638,23 @@ def logout():
 @app.route('/api/check-session', methods=['GET'])
 def check_session():
     if 'user_id' in session:
+        db = get_db()
+        user_id = session['user_id']
+        
+        # Check fee payment for students
+        if session.get('role') == 'student':
+            if not check_fee_payment_status(db, user_id):
+                return jsonify({
+                    'logged_in': True,
+                    'user_id': user_id,
+                    'role': session.get('role'),
+                    'requires_fee_approval': True,
+                    'message': 'Fee payment pending approval'
+                }), 403
+        
         return jsonify({
             'logged_in': True,
-            'user_id': session['user_id'],
+            'user_id': user_id,
             'role': session.get('role')
         })
     return jsonify({'logged_in': False})
@@ -551,6 +670,7 @@ def health_check():
             'timestamp': datetime.utcnow().isoformat()
         })
     except Exception as e:
+        logger.error(f"Health check failed: {e}")
         return jsonify({
             'status': 'unhealthy',
             'database': 'disconnected',
@@ -579,6 +699,7 @@ def user_profile(user_id):
                 return jsonify(user)
             return jsonify({'error': 'User not found'}), 404
         except Exception as e:
+            logger.error(f"Get user profile error: {e}")
             return jsonify({'error': f'Database error: {str(e)}'}), 500
     
     elif request.method == 'PUT':
@@ -588,7 +709,7 @@ def user_profile(user_id):
             
             allowed_fields = ['first_name', 'last_name', 'phone', 'address', 
                             'date_of_birth', 'gender', 'department', 'level', 
-                            'specialization']
+                            'specialization', 'fee_payment_required']
             
             for field in allowed_fields:
                 if field in data:
@@ -605,10 +726,450 @@ def user_profile(user_id):
             
             return jsonify({'message': 'Profile updated'})
         except Exception as e:
+            logger.error(f"Update user profile error: {e}")
             return jsonify({'error': f'Database error: {str(e)}'}), 500
 
 # ==============================================
-# STUDENT ROUTES
+# FEE PAYMENT ROUTES
+# ==============================================
+
+@app.route('/api/fee-payments', methods=['GET', 'POST'])
+@login_required
+def fee_payments():
+    db = get_db()
+    
+    if request.method == 'GET':
+        try:
+            if session.get('role') == 'student':
+                payments = list(db.fee_payments.find({
+                    'student_id': ObjectId(session['user_id'])
+                }).sort('payment_date', -1))
+            elif session.get('role') == 'admin':
+                payments = list(db.fee_payments.find().sort('payment_date', -1))
+            else:
+                return jsonify({'error': 'Unauthorized'}), 403
+            
+            # Add student info to payments
+            for payment in payments:
+                student = db.users.find_one({'_id': payment['student_id']})
+                if student:
+                    payment['student_name'] = f"{student.get('first_name', '')} {student.get('last_name', '')}"
+                    payment['student_id_display'] = student.get('student_id', '')
+                    payment['level'] = student.get('level', '')
+                    payment['department'] = student.get('department', '')
+            
+            return jsonify(serialize_list(payments))
+        except Exception as e:
+            logger.error(f"Get fee payments error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'POST':
+        try:
+            if session.get('role') != 'admin':
+                return jsonify({'error': 'Admin access required'}), 403
+            
+            data = request.json
+            
+            # Check if student exists
+            student = db.users.find_one({
+                '_id': ObjectId(data['student_id']),
+                'role': 'student'
+            })
+            if not student:
+                return jsonify({'error': 'Student not found'}), 404
+            
+            # Generate receipt number
+            receipt_number = f"REC{datetime.now().strftime('%Y%m%d')}{str(int(time.time() % 1000)).zfill(3)}"
+            
+            payment = {
+                'student_id': ObjectId(data['student_id']),
+                'amount': float(data['amount']),
+                'payment_date': datetime.fromisoformat(data['payment_date'].replace('Z', '+00:00')),
+                'receipt_number': receipt_number,
+                'payment_method': data.get('payment_method', 'cash'),
+                'academic_year': data.get('academic_year', datetime.now().year),
+                'semester': data.get('semester', 1),
+                'description': data.get('description', ''),
+                'status': 'pending',  # Default to pending, needs admin approval
+                'created_by': ObjectId(session['user_id']),
+                'created_at': datetime.utcnow(),
+                'approved_by': None,
+                'approved_at': None,
+                'notes': data.get('notes', '')
+            }
+            
+            result = db.fee_payments.insert_one(payment)
+            
+            # Create notification for admin
+            admins = list(db.users.find({'role': 'admin'}))
+            for admin in admins:
+                create_notification(
+                    db,
+                    str(admin['_id']),
+                    'New Fee Payment Recorded',
+                    f'Student {student.get("first_name")} {student.get("last_name")} ({student.get("student_id")}) has made a fee payment of ${payment["amount"]}. Requires approval.',
+                    'fee_payment',
+                    str(result.inserted_id)
+                )
+            
+            # Create notification for student
+            create_notification(
+                db,
+                data['student_id'],
+                'Fee Payment Recorded',
+                f'Your fee payment of ${payment["amount"]} has been recorded. Waiting for admin approval.',
+                'fee_payment',
+                str(result.inserted_id)
+            )
+            
+            return jsonify({
+                'message': 'Fee payment recorded successfully',
+                'receipt_number': receipt_number,
+                'payment_id': str(result.inserted_id)
+            }), 201
+        except Exception as e:
+            logger.error(f"Create fee payment error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fee-payments/<payment_id>', methods=['GET', 'PUT', 'DELETE'])
+@login_required
+def fee_payment_detail(payment_id):
+    db = get_db()
+    
+    if request.method == 'GET':
+        try:
+            payment = db.fee_payments.find_one({'_id': ObjectId(payment_id)})
+            if not payment:
+                return jsonify({'error': 'Payment not found'}), 404
+            
+            # Check authorization
+            if session.get('role') == 'student' and str(payment['student_id']) != session['user_id']:
+                return jsonify({'error': 'Unauthorized'}), 403
+            
+            # Add student and admin info
+            payment = serialize_doc(payment)
+            student = db.users.find_one({'_id': ObjectId(payment['student_id'])})
+            if student:
+                payment['student_name'] = f"{student.get('first_name', '')} {student.get('last_name', '')}"
+                payment['student_id_display'] = student.get('student_id', '')
+                payment['student_email'] = student.get('email', '')
+                payment['student_phone'] = student.get('phone', '')
+            
+            if payment.get('created_by'):
+                creator = db.users.find_one({'_id': ObjectId(payment['created_by'])})
+                if creator:
+                    payment['created_by_name'] = f"{creator.get('first_name', '')} {creator.get('last_name', '')}"
+            
+            if payment.get('approved_by'):
+                approver = db.users.find_one({'_id': ObjectId(payment['approved_by'])})
+                if approver:
+                    payment['approved_by_name'] = f"{approver.get('first_name', '')} {approver.get('last_name', '')}"
+            
+            return jsonify(payment)
+        except Exception as e:
+            logger.error(f"Get fee payment detail error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'PUT':
+        try:
+            if session.get('role') != 'admin':
+                return jsonify({'error': 'Admin access required'}), 403
+            
+            data = request.json
+            payment = db.fee_payments.find_one({'_id': ObjectId(payment_id)})
+            if not payment:
+                return jsonify({'error': 'Payment not found'}), 404
+            
+            update_data = {}
+            allowed_fields = ['amount', 'payment_date', 'payment_method', 'academic_year', 
+                            'semester', 'description', 'notes', 'status']
+            
+            for field in allowed_fields:
+                if field in data:
+                    if field == 'payment_date':
+                        update_data[field] = datetime.fromisoformat(data[field].replace('Z', '+00:00'))
+                    else:
+                        update_data[field] = data[field]
+            
+            # If status is being updated to approved
+            if 'status' in update_data and update_data['status'] == 'approved':
+                update_data['approved_by'] = ObjectId(session['user_id'])
+                update_data['approved_at'] = datetime.utcnow()
+                
+                # Create notification for student
+                student = db.users.find_one({'_id': payment['student_id']})
+                if student:
+                    create_notification(
+                        db,
+                        str(payment['student_id']),
+                        'Fee Payment Approved',
+                        f'Your fee payment of ${payment["amount"]} has been approved. You now have full access to the system.',
+                        'fee_payment_approved',
+                        payment_id
+                    )
+            
+            db.fee_payments.update_one(
+                {'_id': ObjectId(payment_id)},
+                {'$set': update_data}
+            )
+            
+            return jsonify({'message': 'Payment updated successfully'})
+        except Exception as e:
+            logger.error(f"Update fee payment error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'DELETE':
+        try:
+            if session.get('role') != 'admin':
+                return jsonify({'error': 'Admin access required'}), 403
+            
+            result = db.fee_payments.delete_one({'_id': ObjectId(payment_id)})
+            if result.deleted_count == 0:
+                return jsonify({'error': 'Payment not found'}), 404
+            
+            return jsonify({'message': 'Payment deleted successfully'})
+        except Exception as e:
+            logger.error(f"Delete fee payment error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fee-payments/student/<student_id>', methods=['GET'])
+@login_required
+def student_fee_payments(student_id):
+    try:
+        if session['user_id'] != student_id and session.get('role') != 'admin':
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        db = get_db()
+        payments = list(db.fee_payments.find({
+            'student_id': ObjectId(student_id)
+        }).sort('payment_date', -1))
+        
+        # Add status summary
+        total_paid = sum(p['amount'] for p in payments if p['status'] == 'approved')
+        pending_payments = [p for p in payments if p['status'] == 'pending']
+        approved_payments = [p for p in payments if p['status'] == 'approved']
+        
+        # Get fee structure if available
+        student = db.users.find_one({'_id': ObjectId(student_id)})
+        fee_structure = None
+        if student:
+            fee_structure = db.fee_structures.find_one({
+                'level': student.get('level'),
+                'department': student.get('department'),
+                'academic_year': datetime.now().year
+            })
+        
+        return jsonify({
+            'payments': serialize_list(payments),
+            'summary': {
+                'total_paid': total_paid,
+                'pending_count': len(pending_payments),
+                'approved_count': len(approved_payments),
+                'has_approved_payment': len(approved_payments) > 0
+            },
+            'fee_structure': serialize_doc(fee_structure) if fee_structure else None
+        })
+    except Exception as e:
+        logger.error(f"Get student fee payments error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fee-structures', methods=['GET', 'POST'])
+@admin_required
+def fee_structures():
+    db = get_db()
+    
+    if request.method == 'GET':
+        try:
+            fee_structures = list(db.fee_structures.find().sort('academic_year', -1))
+            return jsonify(serialize_list(fee_structures))
+        except Exception as e:
+            logger.error(f"Get fee structures error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'POST':
+        try:
+            data = request.json
+            
+            # Check if fee structure already exists
+            existing = db.fee_structures.find_one({
+                'level': data['level'],
+                'department': data['department'],
+                'academic_year': data['academic_year'],
+                'semester': data.get('semester', 1)
+            })
+            
+            if existing:
+                return jsonify({'error': 'Fee structure already exists for this level, department, and academic year'}), 400
+            
+            fee_structure = {
+                'level': data['level'],
+                'department': data['department'],
+                'academic_year': data['academic_year'],
+                'semester': data.get('semester', 1),
+                'tuition_fee': float(data['tuition_fee']),
+                'registration_fee': float(data.get('registration_fee', 0)),
+                'library_fee': float(data.get('library_fee', 0)),
+                'sports_fee': float(data.get('sports_fee', 0)),
+                'lab_fee': float(data.get('lab_fee', 0)),
+                'other_fees': float(data.get('other_fees', 0)),
+                'description': data.get('description', ''),
+                'is_active': data.get('is_active', True),
+                'created_by': ObjectId(session['user_id']),
+                'created_at': datetime.utcnow(),
+                'updated_at': datetime.utcnow()
+            }
+            
+            result = db.fee_structures.insert_one(fee_structure)
+            
+            return jsonify({
+                'message': 'Fee structure created successfully',
+                'fee_structure_id': str(result.inserted_id)
+            }), 201
+        except Exception as e:
+            logger.error(f"Create fee structure error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fee-structures/<structure_id>', methods=['GET', 'PUT', 'DELETE'])
+@admin_required
+def fee_structure_detail(structure_id):
+    db = get_db()
+    
+    if request.method == 'GET':
+        try:
+            fee_structure = db.fee_structures.find_one({'_id': ObjectId(structure_id)})
+            if not fee_structure:
+                return jsonify({'error': 'Fee structure not found'}), 404
+            
+            return jsonify(serialize_doc(fee_structure))
+        except Exception as e:
+            logger.error(f"Get fee structure detail error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'PUT':
+        try:
+            data = request.json
+            fee_structure = db.fee_structures.find_one({'_id': ObjectId(structure_id)})
+            if not fee_structure:
+                return jsonify({'error': 'Fee structure not found'}), 404
+            
+            update_data = {}
+            allowed_fields = ['tuition_fee', 'registration_fee', 'library_fee', 'sports_fee', 
+                            'lab_fee', 'other_fees', 'description', 'is_active', 'academic_year']
+            
+            for field in allowed_fields:
+                if field in data:
+                    if field in ['tuition_fee', 'registration_fee', 'library_fee', 'sports_fee', 'lab_fee', 'other_fees']:
+                        update_data[field] = float(data[field])
+                    else:
+                        update_data[field] = data[field]
+            
+            update_data['updated_at'] = datetime.utcnow()
+            
+            db.fee_structures.update_one(
+                {'_id': ObjectId(structure_id)},
+                {'$set': update_data}
+            )
+            
+            return jsonify({'message': 'Fee structure updated successfully'})
+        except Exception as e:
+            logger.error(f"Update fee structure error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'DELETE':
+        try:
+            result = db.fee_structures.delete_one({'_id': ObjectId(structure_id)})
+            if result.deleted_count == 0:
+                return jsonify({'error': 'Fee structure not found'}), 404
+            
+            return jsonify({'message': 'Fee structure deleted successfully'})
+        except Exception as e:
+            logger.error(f"Delete fee structure error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fee-payments/approve/<payment_id>', methods=['POST'])
+@admin_required
+def approve_fee_payment(payment_id):
+    try:
+        db = get_db()
+        
+        payment = db.fee_payments.find_one({'_id': ObjectId(payment_id)})
+        if not payment:
+            return jsonify({'error': 'Payment not found'}), 404
+        
+        if payment['status'] == 'approved':
+            return jsonify({'error': 'Payment already approved'}), 400
+        
+        # Update payment status
+        db.fee_payments.update_one(
+            {'_id': ObjectId(payment_id)},
+            {'$set': {
+                'status': 'approved',
+                'approved_by': ObjectId(session['user_id']),
+                'approved_at': datetime.utcnow()
+            }}
+        )
+        
+        # Create notification for student
+        student = db.users.find_one({'_id': payment['student_id']})
+        if student:
+            create_notification(
+                db,
+                str(payment['student_id']),
+                'Fee Payment Approved',
+                f'Your fee payment of ${payment["amount"]} has been approved. You now have full access to the system.',
+                'fee_payment_approved',
+                payment_id
+            )
+        
+        return jsonify({'message': 'Fee payment approved successfully'})
+    except Exception as e:
+        logger.error(f"Approve fee payment error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fee-payments/reject/<payment_id>', methods=['POST'])
+@admin_required
+def reject_fee_payment(payment_id):
+    try:
+        data = request.json
+        db = get_db()
+        
+        payment = db.fee_payments.find_one({'_id': ObjectId(payment_id)})
+        if not payment:
+            return jsonify({'error': 'Payment not found'}), 404
+        
+        if payment['status'] == 'rejected':
+            return jsonify({'error': 'Payment already rejected'}), 400
+        
+        # Update payment status
+        db.fee_payments.update_one(
+            {'_id': ObjectId(payment_id)},
+            {'$set': {
+                'status': 'rejected',
+                'rejected_by': ObjectId(session['user_id']),
+                'rejected_at': datetime.utcnow(),
+                'rejection_reason': data.get('rejection_reason', '')
+            }}
+        )
+        
+        # Create notification for student
+        student = db.users.find_one({'_id': payment['student_id']})
+        if student:
+            create_notification(
+                db,
+                str(payment['student_id']),
+                'Fee Payment Rejected',
+                f'Your fee payment of ${payment["amount"]} has been rejected. Reason: {data.get("rejection_reason", "No reason provided")}. Please contact administration.',
+                'fee_payment_rejected',
+                payment_id
+            )
+        
+        return jsonify({'message': 'Fee payment rejected successfully'})
+    except Exception as e:
+        logger.error(f"Reject fee payment error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ==============================================
+# STUDENT ROUTES (with fee payment check)
 # ==============================================
 
 @app.route('/api/students/<student_id>/courses', methods=['GET'])
@@ -617,6 +1178,16 @@ def get_student_courses(student_id):
     try:
         if session['user_id'] != student_id and session.get('role') != 'admin':
             return jsonify({'error': 'Unauthorized'}), 403
+        
+        # Check fee payment for student
+        if session.get('role') == 'student':
+            db = get_db()
+            if not check_fee_payment_status(db, student_id):
+                return jsonify({
+                    'error': 'Fee payment pending approval',
+                    'requires_fee_approval': True,
+                    'message': 'Please wait for fee payment approval to access courses'
+                }), 403
         
         db = get_db()
         
@@ -636,6 +1207,95 @@ def get_student_courses(student_id):
         
         return jsonify(serialize_list(courses))
     except Exception as e:
+        logger.error(f"Get student courses error: {e}")
+        return jsonify({'error': str(e)}), 500
+    
+# ==============================================
+# STUDENT FEE STATUS ROUTES
+# ==============================================
+
+@app.route('/api/students/<student_id>/fee-status', methods=['GET'])
+@login_required
+def get_student_fee_status(student_id):
+    try:
+        if session['user_id'] != student_id and session.get('role') != 'admin':
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        db = get_db()
+        
+        # Get student info
+        student = db.users.find_one({'_id': ObjectId(student_id)})
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Get fee payments
+        payments = list(db.fee_payments.find({
+            'student_id': ObjectId(student_id)
+        }).sort('payment_date', -1))
+        
+        # Calculate summary
+        total_paid = sum(p['amount'] for p in payments if p['status'] == 'approved')
+        pending_payments = [p for p in payments if p['status'] == 'pending']
+        approved_payments = [p for p in payments if p['status'] == 'approved']
+        has_approved_payment = len(approved_payments) > 0
+        
+        # Get fee structure for student's level and department
+        fee_structure = None
+        if student.get('level') and student.get('department'):
+            fee_structure = db.fee_structures.find_one({
+                'level': student.get('level'),
+                'department': student.get('department'),
+                'is_active': True
+            })
+        
+        return jsonify({
+            'student_info': {
+                'id': str(student['_id']),
+                'first_name': student.get('first_name', ''),
+                'last_name': student.get('last_name', ''),
+                'student_id': student.get('student_id', ''),
+                'level': student.get('level', ''),
+                'department': student.get('department', ''),
+                'email': student.get('email', '')
+            },
+            'payments': serialize_list(payments),
+            'summary': {
+                'total_paid': total_paid,
+                'pending_count': len(pending_payments),
+                'approved_count': len(approved_payments),
+                'has_approved_payment': has_approved_payment,
+                'requires_fee_payment': student.get('fee_payment_required', True)
+            },
+            'fee_structure': serialize_doc(fee_structure) if fee_structure else None,
+            'has_access_to_courses': has_approved_payment or not student.get('fee_payment_required', True)
+        })
+    except Exception as e:
+        logger.error(f"Get student fee status error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/students/<student_id>/courses-access', methods=['GET'])
+@login_required
+def check_student_course_access(student_id):
+    try:
+        if session['user_id'] != student_id and session.get('role') != 'admin':
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        db = get_db()
+        
+        # Check fee payment status
+        has_access = check_fee_payment_status(db, student_id)
+        
+        # Get student info
+        student = db.users.find_one({'_id': ObjectId(student_id)})
+        
+        return jsonify({
+            'has_access': has_access,
+            'student_id': str(student['_id']) if student else student_id,
+            'requires_fee_approval': not has_access and student.get('fee_payment_required', True) if student else True,
+            'message': 'Access granted' if has_access else 'Fee payment approval required'
+        })
+    except Exception as e:
+        logger.error(f"Check student course access error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/students/<student_id>/subject-combination', methods=['GET'])
@@ -644,6 +1304,16 @@ def get_student_subject_combination(student_id):
     try:
         if session['user_id'] != student_id and session.get('role') != 'admin':
             return jsonify({'error': 'Unauthorized'}), 403
+        
+        # Check fee payment for student
+        if session.get('role') == 'student':
+            db = get_db()
+            if not check_fee_payment_status(db, student_id):
+                return jsonify({
+                    'error': 'Fee payment pending approval',
+                    'requires_fee_approval': True,
+                    'message': 'Please wait for fee payment approval to access subject combination'
+                }), 403
         
         db = get_db()
         
@@ -683,6 +1353,7 @@ def get_student_subject_combination(student_id):
             'total_credits': total_credits
         })
     except Exception as e:
+        logger.error(f"Get student subject combination error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/students/<student_id>/grades', methods=['GET'])
@@ -691,6 +1362,16 @@ def get_student_grades(student_id):
     try:
         if session['user_id'] != student_id and session.get('role') != 'admin':
             return jsonify({'error': 'Unauthorized'}), 403
+        
+        # Check fee payment for student
+        if session.get('role') == 'student':
+            db = get_db()
+            if not check_fee_payment_status(db, student_id):
+                return jsonify({
+                    'error': 'Fee payment pending approval',
+                    'requires_fee_approval': True,
+                    'message': 'Please wait for fee payment approval to access grades'
+                }), 403
         
         db = get_db()
         course_id = request.args.get('course_id')
@@ -715,6 +1396,7 @@ def get_student_grades(student_id):
         
         return jsonify(grades)
     except Exception as e:
+        logger.error(f"Get student grades error: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ==============================================
@@ -723,11 +1405,48 @@ def get_student_grades(student_id):
 
 @app.route('/api/courses', methods=['GET'])
 @login_required
-def get_all_courses():
+def get_courses():
     try:
         db = get_db()
-        courses = list(db.courses.find({'status': 'active'}))
         
+        # Check fee payment for students
+        if session.get('role') == 'student':
+            if not check_fee_payment_status(db, session['user_id']):
+                return jsonify({
+                    'error': 'Fee payment pending approval',
+                    'requires_fee_approval': True,
+                    'message': 'Please wait for fee payment approval to access courses'
+                }), 403
+        
+        # Get courses based on user role
+        if session.get('role') == 'student':
+            student = db.users.find_one({'_id': ObjectId(session['user_id'])})
+            query = {'status': 'active'}
+            
+            # Filter by student's level and department
+            if student.get('level'):
+                query['level'] = student.get('level')
+            if student.get('department'):
+                query['department'] = student.get('department')
+            
+            courses = list(db.courses.find(query))
+        elif session.get('role') == 'teacher':
+            teacher = db.users.find_one({'_id': ObjectId(session['user_id'])})
+            teacher_dept = teacher.get('department')
+            
+            # Get courses for teacher's department and compulsory courses
+            courses = list(db.courses.find({
+                'status': 'active',
+                '$or': [
+                    {'department': teacher_dept},
+                    {'department': 'all'}
+                ]
+            }))
+        else:
+            # Admin sees all courses
+            courses = list(db.courses.find())
+        
+        # Get teacher names for each course
         for course in courses:
             teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
             teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
@@ -736,32 +1455,7 @@ def get_all_courses():
         
         return jsonify(serialize_list(courses))
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/courses/for-teacher', methods=['GET'])
-@teacher_required
-def get_courses_for_teacher():
-    try:
-        db = get_db()
-        teacher = db.users.find_one({'_id': ObjectId(session['user_id'])})
-        
-        # Get courses for teacher's department OR compulsory courses (department='all')
-        courses = list(db.courses.find({
-            '$or': [
-                {'department': teacher.get('department', '')},
-                {'department': 'all'}
-            ],
-            'status': 'active'
-        }))
-        
-        for course in courses:
-            teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
-            teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
-            teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
-            course['teacher_names'] = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers])
-        
-        return jsonify(serialize_list(courses))
-    except Exception as e:
+        logger.error(f"Get courses error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/courses/<course_id>', methods=['GET'])
@@ -769,12 +1463,21 @@ def get_courses_for_teacher():
 def get_course(course_id):
     try:
         db = get_db()
-        course = db.courses.find_one({'_id': ObjectId(course_id)})
         
+        # Check fee payment for students
+        if session.get('role') == 'student':
+            if not check_fee_payment_status(db, session['user_id']):
+                return jsonify({
+                    'error': 'Fee payment pending approval',
+                    'requires_fee_approval': True,
+                    'message': 'Please wait for fee payment approval to access course details'
+                }), 403
+        
+        course = db.courses.find_one({'_id': ObjectId(course_id)})
         if not course:
             return jsonify({'error': 'Course not found'}), 404
         
-        # Get teacher info
+        # Get teacher names
         teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
         teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
         teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
@@ -782,20 +1485,37 @@ def get_course(course_id):
         
         return jsonify(serialize_doc(course))
     except Exception as e:
+        logger.error(f"Get course detail error: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/courses/<course_id>/students', methods=['GET'])
-@login_required
-def get_course_students(course_id):
+@app.route('/api/courses/for-teacher', methods=['GET'])
+@teacher_required
+def get_courses_for_teacher():
     try:
         db = get_db()
         
-        enrollments = list(db.enrollments.find({'course_id': ObjectId(course_id)}))
-        student_ids = [ObjectId(enrollment['student_id']) for enrollment in enrollments]
-        students = list(db.users.find({'_id': {'$in': student_ids}}))
+        teacher = db.users.find_one({'_id': ObjectId(session['user_id'])})
+        teacher_dept = teacher.get('department')
         
-        return jsonify(serialize_list(students))
+        # Get courses for teacher's department and compulsory courses
+        courses = list(db.courses.find({
+            'status': 'active',
+            '$or': [
+                {'department': teacher_dept},
+                {'department': 'all'}
+            ]
+        }))
+        
+        # Get teacher names for each course
+        for course in courses:
+            teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
+            teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
+            teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
+            course['teacher_names'] = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers])
+        
+        return jsonify(serialize_list(courses))
     except Exception as e:
+        logger.error(f"Get courses for teacher error: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ==============================================
@@ -806,8 +1526,16 @@ def get_course_students(course_id):
 @student_required
 def enroll_in_course():
     try:
-        data = request.json
+        # Check fee payment
         db = get_db()
+        if not check_fee_payment_status(db, session['user_id']):
+            return jsonify({
+                'error': 'Fee payment pending approval',
+                'requires_fee_approval': True,
+                'message': 'Please wait for fee payment approval before enrolling in courses'
+            }), 403
+        
+        data = request.json
         
         # Check if already enrolled
         existing = db.enrollments.find_one({
@@ -852,6 +1580,7 @@ def enroll_in_course():
         
         return jsonify({'message': 'Successfully enrolled in course'})
     except Exception as e:
+        logger.error(f"Enroll in course error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/enrollments/<enrollment_id>/student/<student_id>', methods=['DELETE'])
@@ -862,6 +1591,7 @@ def unenroll_from_course(enrollment_id, student_id):
             return jsonify({'error': 'Unauthorized'}), 403
         
         db = get_db()
+        
         result = db.enrollments.delete_one({
             '_id': ObjectId(enrollment_id),
             'student_id': ObjectId(student_id)
@@ -872,11 +1602,108 @@ def unenroll_from_course(enrollment_id, student_id):
         
         return jsonify({'message': 'Successfully unenrolled from course'})
     except Exception as e:
+        logger.error(f"Unenroll from course error: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ==============================================
-# TEACHER ROUTES
+# TEACHER COURSE MANAGEMENT
 # ==============================================
+
+@app.route('/api/teachers/<teacher_id>/assign-course', methods=['POST'])
+@teacher_required
+def assign_course_to_teacher(teacher_id):
+    try:
+        if session['user_id'] != teacher_id:
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        data = request.json
+        db = get_db()
+        
+        course = db.courses.find_one({'_id': ObjectId(data['course_id'])})
+        if not course:
+            return jsonify({'error': 'Course not found'}), 404
+        
+        # Check if course is already assigned to this teacher
+        existing = db.teacher_courses.find_one({
+            'teacher_id': ObjectId(teacher_id),
+            'course_id': ObjectId(data['course_id'])
+        })
+        
+        if existing:
+            return jsonify({'error': 'Course already assigned to this teacher'}), 400
+        
+        # Check if course has teacher lock and is already assigned to another teacher
+        if course.get('teacher_lock') == True:
+            existing_teacher = db.teacher_courses.find_one({
+                'course_id': ObjectId(data['course_id'])
+            })
+            
+            if existing_teacher:
+                # Create approval request
+                approval_request = {
+                    'teacher_id': ObjectId(teacher_id),
+                    'course_id': ObjectId(data['course_id']),
+                    'current_teacher_id': existing_teacher['teacher_id'],
+                    'status': 'pending',
+                    'requested_at': datetime.utcnow()
+                }
+                
+                db.course_approval_requests.insert_one(approval_request)
+                
+                # Notify admin
+                admins = list(db.users.find({'role': 'admin'}))
+                teacher = db.users.find_one({'_id': ObjectId(teacher_id)})
+                
+                for admin in admins:
+                    create_notification(
+                        db,
+                        str(admin['_id']),
+                        'Course Approval Request',
+                        f'Teacher {teacher.get("first_name")} {teacher.get("last_name")} requested to teach {course.get("title")}. Course is currently assigned to another teacher.',
+                        'approval_request',
+                        str(approval_request['_id'])
+                    )
+                
+                return jsonify({
+                    'message': 'Approval request sent to admin',
+                    'requires_approval': True
+                })
+        
+        # Assign course to teacher
+        teacher_course = {
+            'teacher_id': ObjectId(teacher_id),
+            'course_id': ObjectId(data['course_id']),
+            'assigned_at': datetime.utcnow()
+        }
+        
+        db.teacher_courses.insert_one(teacher_course)
+        
+        return jsonify({'message': 'Course assigned successfully'})
+    except Exception as e:
+        logger.error(f"Assign course to teacher error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/teachers/<teacher_id>/unassign-course/<course_id>', methods=['DELETE'])
+@teacher_required
+def unassign_course_from_teacher(teacher_id, course_id):
+    try:
+        if session['user_id'] != teacher_id:
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        db = get_db()
+        
+        result = db.teacher_courses.delete_one({
+            'teacher_id': ObjectId(teacher_id),
+            'course_id': ObjectId(course_id)
+        })
+        
+        if result.deleted_count == 0:
+            return jsonify({'error': 'Course assignment not found'}), 404
+        
+        return jsonify({'message': 'Course unassigned successfully'})
+    except Exception as e:
+        logger.error(f"Unassign course from teacher error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/teachers/<teacher_id>/courses', methods=['GET'])
 @login_required
@@ -893,204 +1720,8 @@ def get_teacher_courses(teacher_id):
         
         return jsonify(serialize_list(courses))
     except Exception as e:
+        logger.error(f"Get teacher courses error: {e}")
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/teachers/<teacher_id>/assign-course', methods=['POST'])
-@teacher_required
-def assign_course_to_teacher(teacher_id):
-    try:
-        if session['user_id'] != teacher_id:
-            return jsonify({'error': 'Unauthorized'}), 403
-        
-        data = request.json
-        db = get_db()
-        
-        # Check if course exists
-        course = db.courses.find_one({'_id': ObjectId(data['course_id'])})
-        if not course:
-            return jsonify({'error': 'Course not found'}), 404
-        
-        # Check if course is teacher locked and already has a teacher
-        if course.get('teacher_lock'):
-            existing_teacher = db.teacher_courses.find_one({'course_id': ObjectId(data['course_id'])})
-            if existing_teacher:
-                # Create approval request
-                approval_request = {
-                    'teacher_id': ObjectId(teacher_id),
-                    'course_id': ObjectId(data['course_id']),
-                    'status': 'pending',
-                    'requested_at': datetime.utcnow()
-                }
-                db.course_approval_requests.insert_one(approval_request)
-                
-                return jsonify({
-                    'requires_approval': True,
-                    'message': 'Course requires admin approval (already assigned to another teacher)'
-                })
-        
-        # Assign course to teacher
-        assignment = {
-            'teacher_id': ObjectId(teacher_id),
-            'course_id': ObjectId(data['course_id']),
-            'assigned_at': datetime.utcnow()
-        }
-        
-        try:
-            db.teacher_courses.insert_one(assignment)
-        except DuplicateKeyError:
-            return jsonify({'error': 'Already assigned to this course'}), 400
-        
-        return jsonify({'message': 'Course assigned successfully'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/teachers/<teacher_id>/unassign-course/<course_id>', methods=['DELETE'])
-@teacher_required
-def unassign_course_from_teacher(teacher_id, course_id):
-    try:
-        if session['user_id'] != teacher_id:
-            return jsonify({'error': 'Unauthorized'}), 403
-        
-        db = get_db()
-        result = db.teacher_courses.delete_one({
-            'teacher_id': ObjectId(teacher_id),
-            'course_id': ObjectId(course_id)
-        })
-        
-        if result.deleted_count == 0:
-            return jsonify({'error': 'Assignment not found'}), 404
-        
-        return jsonify({'message': 'Course unassigned successfully'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/teachers/<teacher_id>/courses/<course_id>/students/<student_id>', methods=['DELETE'])
-@teacher_required
-def remove_student_from_course(teacher_id, course_id, student_id):
-    try:
-        if session['user_id'] != teacher_id:
-            return jsonify({'error': 'Unauthorized'}), 403
-        
-        db = get_db()
-        
-        # Verify teacher is assigned to this course
-        teacher_course = db.teacher_courses.find_one({
-            'teacher_id': ObjectId(teacher_id),
-            'course_id': ObjectId(course_id)
-        })
-        
-        if not teacher_course:
-            return jsonify({'error': 'You are not assigned to this course'}), 403
-        
-        # Remove enrollment
-        result = db.enrollments.delete_one({
-            'student_id': ObjectId(student_id),
-            'course_id': ObjectId(course_id)
-        })
-        
-        if result.deleted_count == 0:
-            return jsonify({'error': 'Student not enrolled in this course'}), 404
-        
-        # Create notification for student
-        course = db.courses.find_one({'_id': ObjectId(course_id)})
-        student = db.users.find_one({'_id': ObjectId(student_id)})
-        teacher = db.users.find_one({'_id': ObjectId(teacher_id)})
-        
-        create_notification(
-            db, 
-            student_id,
-            'Removed from Course',
-            f'You have been removed from {course.get("title")} by {teacher.get("first_name")} {teacher.get("last_name")}',
-            'course',
-            course_id
-        )
-        
-        return jsonify({'message': 'Student removed from course successfully'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# ==============================================
-# ANNOUNCEMENT ROUTES
-# ==============================================
-
-@app.route('/api/announcements', methods=['GET', 'POST'])
-@login_required
-def announcements():
-    db = get_db()
-    
-    if request.method == 'GET':
-        try:
-            # Get all announcements for courses the user is enrolled in/teaching
-            if session.get('role') == 'student':
-                enrollments = list(db.enrollments.find({'student_id': ObjectId(session['user_id'])}))
-                course_ids = [ObjectId(enrollment['course_id']) for enrollment in enrollments]
-                announcements_list = list(db.announcements.find({
-                    'course_id': {'$in': course_ids}
-                }).sort('created_at', -1).limit(50))
-            elif session.get('role') == 'teacher':
-                teacher_courses = list(db.teacher_courses.find({'teacher_id': ObjectId(session['user_id'])}))
-                course_ids = [tc['course_id'] for tc in teacher_courses]
-                announcements_list = list(db.announcements.find({
-                    'course_id': {'$in': course_ids}
-                }).sort('created_at', -1).limit(50))
-            else:
-                announcements_list = list(db.announcements.find().sort('created_at', -1).limit(50))
-            
-            # Add course and teacher info
-            for announcement in announcements_list:
-                course = db.courses.find_one({'_id': announcement['course_id']})
-                teacher = db.users.find_one({'_id': announcement['teacher_id']})
-                
-                if course:
-                    announcement['course_title'] = course.get('title', '')
-                if teacher:
-                    announcement['teacher_name'] = f"{teacher.get('first_name', '')} {teacher.get('last_name', '')}"
-            
-            return jsonify(serialize_list(announcements_list))
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    elif request.method == 'POST':
-        try:
-            data = request.json
-            
-            # Verify teacher is assigned to this course
-            if session.get('role') == 'teacher':
-                teacher_course = db.teacher_courses.find_one({
-                    'teacher_id': ObjectId(session['user_id']),
-                    'course_id': ObjectId(data['course_id'])
-                })
-                
-                if not teacher_course:
-                    return jsonify({'error': 'You are not assigned to this course'}), 403
-            
-            announcement = {
-                'course_id': ObjectId(data['course_id']),
-                'teacher_id': ObjectId(session['user_id']),
-                'title': data['title'],
-                'content': data['content'],
-                'created_at': datetime.utcnow()
-            }
-            
-            result = db.announcements.insert_one(announcement)
-            
-            # Create notifications for enrolled students
-            enrollments = list(db.enrollments.find({'course_id': ObjectId(data['course_id'])}))
-            course = db.courses.find_one({'_id': ObjectId(data['course_id'])})
-            
-            for enrollment in enrollments:
-                create_notification(
-                    db,
-                    str(enrollment['student_id']),
-                    'New Announcement',
-                    f'New announcement in {course.get("title", "Course")}: {data["title"]}',
-                    'announcement',
-                    str(result.inserted_id)
-                )
-            
-            return jsonify({'message': 'Announcement created successfully'})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
 
 # ==============================================
 # ASSIGNMENT ROUTES
@@ -1109,24 +1740,32 @@ def assignments():
             if course_id:
                 query['course_id'] = ObjectId(course_id)
             
-            assignments_list = list(db.assignments.find(query).sort('created_at', -1))
-            return jsonify(serialize_list(assignments_list))
+            # Check fee payment for students
+            if session.get('role') == 'student':
+                if not check_fee_payment_status(db, session['user_id']):
+                    return jsonify({
+                        'error': 'Fee payment pending approval',
+                        'requires_fee_approval': True,
+                        'message': 'Please wait for fee payment approval to access assignments'
+                    }), 403
+                
+                # Only show assignments for courses student is enrolled in
+                enrollments = list(db.enrollments.find({'student_id': ObjectId(session['user_id'])}))
+                enrolled_course_ids = [e['course_id'] for e in enrollments]
+                query['course_id'] = {'$in': enrolled_course_ids}
+            
+            assignments = list(db.assignments.find(query).sort('due_date', 1))
+            return jsonify(serialize_list(assignments))
         except Exception as e:
+            logger.error(f"Get assignments error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'POST':
         try:
-            data = request.json
+            if session.get('role') != 'teacher':
+                return jsonify({'error': 'Teacher access required'}), 403
             
-            # Verify teacher is assigned to this course
-            if session.get('role') == 'teacher':
-                teacher_course = db.teacher_courses.find_one({
-                    'teacher_id': ObjectId(session['user_id']),
-                    'course_id': ObjectId(data['course_id'])
-                })
-                
-                if not teacher_course:
-                    return jsonify({'error': 'You are not assigned to this course'}), 403
+            data = request.json
             
             assignment = {
                 'course_id': ObjectId(data['course_id']),
@@ -1134,28 +1773,29 @@ def assignments():
                 'title': data['title'],
                 'description': data['description'],
                 'due_date': datetime.fromisoformat(data['due_date'].replace('Z', '+00:00')),
-                'max_points': data['max_points'],
+                'max_points': int(data['max_points']),
                 'created_at': datetime.utcnow()
             }
             
             result = db.assignments.insert_one(assignment)
             
             # Create notifications for enrolled students
-            enrollments = list(db.enrollments.find({'course_id': ObjectId(data['course_id'])}))
-            course = db.courses.find_one({'_id': ObjectId(data['course_id'])})
+            enrollments = list(db.enrollments.find({'course_id': assignment['course_id']}))
+            course = db.courses.find_one({'_id': assignment['course_id']})
             
             for enrollment in enrollments:
                 create_notification(
                     db,
                     str(enrollment['student_id']),
                     'New Assignment',
-                    f'New assignment in {course.get("title", "Course")}: {data["title"]}',
+                    f'New assignment "{assignment["title"]}" posted in {course.get("title", "Course")}. Due: {assignment["due_date"].strftime("%Y-%m-%d %H:%M")}',
                     'assignment',
                     str(result.inserted_id)
                 )
             
             return jsonify({'message': 'Assignment created successfully'})
         except Exception as e:
+            logger.error(f"Create assignment error: {e}")
             return jsonify({'error': str(e)}), 500
 
 @app.route('/api/assignments/<assignment_id>', methods=['GET'])
@@ -1163,45 +1803,23 @@ def assignments():
 def get_assignment(assignment_id):
     try:
         db = get_db()
-        assignment = db.assignments.find_one({'_id': ObjectId(assignment_id)})
         
+        # Check fee payment for students
+        if session.get('role') == 'student':
+            if not check_fee_payment_status(db, session['user_id']):
+                return jsonify({
+                    'error': 'Fee payment pending approval',
+                    'requires_fee_approval': True,
+                    'message': 'Please wait for fee payment approval to access assignment'
+                }), 403
+        
+        assignment = db.assignments.find_one({'_id': ObjectId(assignment_id)})
         if not assignment:
             return jsonify({'error': 'Assignment not found'}), 404
         
         return jsonify(serialize_doc(assignment))
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/assignments/<assignment_id>/submissions', methods=['GET'])
-@login_required
-def get_assignment_submissions(assignment_id):
-    try:
-        db = get_db()
-        
-        # Verify user has access (teacher of course or student who submitted)
-        assignment = db.assignments.find_one({'_id': ObjectId(assignment_id)})
-        if not assignment:
-            return jsonify({'error': 'Assignment not found'}), 404
-        
-        if session.get('role') == 'teacher':
-            teacher_course = db.teacher_courses.find_one({
-                'teacher_id': ObjectId(session['user_id']),
-                'course_id': assignment['course_id']
-            })
-            
-            if not teacher_course:
-                return jsonify({'error': 'You are not assigned to this course'}), 403
-        
-        submissions = list(db.submissions.find({'assignment_id': ObjectId(assignment_id)}))
-        
-        # Add student names
-        for submission in submissions:
-            student = db.users.find_one({'_id': submission['student_id']})
-            if student:
-                submission['student_name'] = f"{student.get('first_name', '')} {student.get('last_name', '')}"
-        
-        return jsonify(serialize_list(submissions))
-    except Exception as e:
+        logger.error(f"Get assignment detail error: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ==============================================
@@ -1212,8 +1830,16 @@ def get_assignment_submissions(assignment_id):
 @student_required
 def create_submission():
     try:
-        data = request.json
+        # Check fee payment
         db = get_db()
+        if not check_fee_payment_status(db, session['user_id']):
+            return jsonify({
+                'error': 'Fee payment pending approval',
+                'requires_fee_approval': True,
+                'message': 'Please wait for fee payment approval before submitting assignments'
+            }), 403
+        
+        data = request.json
         
         # Check if assignment exists and is not past due
         assignment = db.assignments.find_one({'_id': ObjectId(data['assignment_id'])})
@@ -1260,6 +1886,26 @@ def create_submission():
         
         return jsonify({'message': 'Submission created successfully'})
     except Exception as e:
+        logger.error(f"Create submission error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/assignments/<assignment_id>/submissions', methods=['GET'])
+@teacher_required
+def get_submissions(assignment_id):
+    try:
+        db = get_db()
+        
+        submissions = list(db.submissions.find({'assignment_id': ObjectId(assignment_id)}))
+        
+        # Add student names
+        for submission in submissions:
+            student = db.users.find_one({'_id': submission['student_id']})
+            if student:
+                submission['student_name'] = f"{student.get('first_name', '')} {student.get('last_name', '')}"
+        
+        return jsonify(serialize_list(submissions))
+    except Exception as e:
+        logger.error(f"Get submissions error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/grade', methods=['POST'])
@@ -1269,53 +1915,190 @@ def grade_submission():
         data = request.json
         db = get_db()
         
-        # Verify teacher is assigned to this course
-        assignment = db.assignments.find_one({'_id': ObjectId(data['assignment_id'])})
-        if not assignment:
-            return jsonify({'error': 'Assignment not found'}), 404
-        
-        teacher_course = db.teacher_courses.find_one({
-            'teacher_id': ObjectId(session['user_id']),
-            'course_id': assignment['course_id']
-        })
-        
-        if not teacher_course:
-            return jsonify({'error': 'You are not assigned to this course'}), 403
-        
-        # Update submission
-        result = db.submissions.update_one(
+        # Update submission with grade
+        db.submissions.update_one(
             {
                 'assignment_id': ObjectId(data['assignment_id']),
                 'student_id': ObjectId(data['student_id'])
             },
             {
                 '$set': {
-                    'grade': data['grade'],
+                    'grade': int(data['grade']),
                     'feedback': data.get('feedback', ''),
                     'graded_at': datetime.utcnow()
                 }
             }
         )
         
-        if result.matched_count == 0:
-            return jsonify({'error': 'Submission not found'}), 404
-        
         # Create notification for student
         assignment = db.assignments.find_one({'_id': ObjectId(data['assignment_id'])})
+        course = db.courses.find_one({'_id': assignment['course_id']})
         teacher = db.users.find_one({'_id': ObjectId(session['user_id'])})
         
         create_notification(
             db,
             data['student_id'],
             'Assignment Graded',
-            f'Your submission for {assignment.get("title", "Assignment")} has been graded by {teacher.get("first_name", "Teacher")}',
+            f'Your assignment "{assignment["title"]}" in {course.get("title", "Course")} has been graded by {teacher.get("first_name", "Teacher")} {teacher.get("last_name", "")}. Grade: {data["grade"]}',
             'grade',
             data['assignment_id']
         )
         
         return jsonify({'message': 'Grade submitted successfully'})
     except Exception as e:
+        logger.error(f"Grade submission error: {e}")
         return jsonify({'error': str(e)}), 500
+
+# ==============================================
+# ANNOUNCEMENT ROUTES
+# ==============================================
+
+@app.route('/api/announcements', methods=['GET', 'POST'])
+@login_required
+def announcements():
+    db = get_db()
+    
+    if request.method == 'GET':
+        try:
+            # Check fee payment for students
+            if session.get('role') == 'student':
+                if not check_fee_payment_status(db, session['user_id']):
+                    return jsonify({
+                        'error': 'Fee payment pending approval',
+                        'requires_fee_approval': True,
+                        'message': 'Please wait for fee payment approval to access announcements'
+                    }), 403
+            
+            announcements = list(db.announcements.find().sort('created_at', -1).limit(20))
+            
+            # Add teacher and course info
+            for ann in announcements:
+                teacher = db.users.find_one({'_id': ann['teacher_id']})
+                if teacher:
+                    ann['teacher_name'] = f"{teacher.get('first_name', '')} {teacher.get('last_name', '')}"
+                
+                course = db.courses.find_one({'_id': ann['course_id']})
+                if course:
+                    ann['course_title'] = course.get('title', '')
+            
+            return jsonify(serialize_list(announcements))
+        except Exception as e:
+            logger.error(f"Get announcements error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'POST':
+        try:
+            if session.get('role') != 'teacher':
+                return jsonify({'error': 'Teacher access required'}), 403
+            
+            data = request.json
+            
+            announcement = {
+                'course_id': ObjectId(data['course_id']),
+                'teacher_id': ObjectId(session['user_id']),
+                'title': data['title'],
+                'content': data['content'],
+                'created_at': datetime.utcnow()
+            }
+            
+            result = db.announcements.insert_one(announcement)
+            
+            # Create notifications for enrolled students
+            enrollments = list(db.enrollments.find({'course_id': announcement['course_id']}))
+            course = db.courses.find_one({'_id': announcement['course_id']})
+            teacher = db.users.find_one({'_id': ObjectId(session['user_id'])})
+            
+            for enrollment in enrollments:
+                create_notification(
+                    db,
+                    str(enrollment['student_id']),
+                    'New Announcement',
+                    f'New announcement "{announcement["title"]}" from {teacher.get("first_name", "Teacher")} in {course.get("title", "Course")}',
+                    'announcement',
+                    str(result.inserted_id)
+                )
+            
+            return jsonify({'message': 'Announcement posted successfully'})
+        except Exception as e:
+            logger.error(f"Create announcement error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+# ==============================================
+# MATERIALS ROUTES
+# ==============================================
+
+@app.route('/api/materials', methods=['GET', 'POST'])
+@login_required
+def materials():
+    db = get_db()
+    
+    if request.method == 'GET':
+        try:
+            course_id = request.args.get('course_id')
+            query = {}
+            
+            if course_id:
+                query['course_id'] = ObjectId(course_id)
+            
+            # Check fee payment for students
+            if session.get('role') == 'student':
+                if not check_fee_payment_status(db, session['user_id']):
+                    return jsonify({
+                        'error': 'Fee payment pending approval',
+                        'requires_fee_approval': True,
+                        'message': 'Please wait for fee payment approval to access materials'
+                    }), 403
+            
+            materials = list(db.materials.find(query).sort('created_at', -1))
+            
+            # Add teacher info
+            for mat in materials:
+                teacher = db.users.find_one({'_id': mat['teacher_id']})
+                if teacher:
+                    mat['teacher_name'] = f"{teacher.get('first_name', '')} {teacher.get('last_name', '')}"
+            
+            return jsonify(serialize_list(materials))
+        except Exception as e:
+            logger.error(f"Get materials error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'POST':
+        try:
+            if session.get('role') != 'teacher':
+                return jsonify({'error': 'Teacher access required'}), 403
+            
+            data = request.json
+            
+            material = {
+                'course_id': ObjectId(data['course_id']),
+                'teacher_id': ObjectId(session['user_id']),
+                'title': data['title'],
+                'description': data.get('description', ''),
+                'material_type': data['material_type'],
+                'file_url': data.get('file_url', ''),
+                'created_at': datetime.utcnow()
+            }
+            
+            result = db.materials.insert_one(material)
+            
+            # Create notifications for enrolled students
+            enrollments = list(db.enrollments.find({'course_id': material['course_id']}))
+            course = db.courses.find_one({'_id': material['course_id']})
+            
+            for enrollment in enrollments:
+                create_notification(
+                    db,
+                    str(enrollment['student_id']),
+                    'New Course Material',
+                    f'New material "{material["title"]}" added to {course.get("title", "Course")}',
+                    'material',
+                    str(result.inserted_id)
+                )
+            
+            return jsonify({'message': 'Material added successfully'})
+        except Exception as e:
+            logger.error(f"Create material error: {e}")
+            return jsonify({'error': str(e)}), 500
 
 # ==============================================
 # DISCUSSION ROUTES
@@ -1329,12 +2112,21 @@ def discussions():
     if request.method == 'GET':
         try:
             course_id = request.args.get('course_id')
-            if not course_id:
-                return jsonify({'error': 'Course ID required'}), 400
+            query = {}
             
-            posts = list(db.discussion_posts.find({
-                'course_id': ObjectId(course_id)
-            }).sort('created_at', -1))
+            if course_id:
+                query['course_id'] = ObjectId(course_id)
+            
+            # Check fee payment for students
+            if session.get('role') == 'student':
+                if not check_fee_payment_status(db, session['user_id']):
+                    return jsonify({
+                        'error': 'Fee payment pending approval',
+                        'requires_fee_approval': True,
+                        'message': 'Please wait for fee payment approval to access discussions'
+                    }), 403
+            
+            posts = list(db.discussion_posts.find(query).sort('created_at', -1))
             
             # Add author info
             for post in posts:
@@ -1345,10 +2137,20 @@ def discussions():
             
             return jsonify(serialize_list(posts))
         except Exception as e:
+            logger.error(f"Get discussions error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'POST':
         try:
+            # Check fee payment for students
+            if session.get('role') == 'student':
+                if not check_fee_payment_status(db, session['user_id']):
+                    return jsonify({
+                        'error': 'Fee payment pending approval',
+                        'requires_fee_approval': True,
+                        'message': 'Please wait for fee payment approval before posting discussions'
+                    }), 403
+            
             data = request.json
             
             # Verify user is enrolled in/teaching this course
@@ -1381,6 +2183,7 @@ def discussions():
             
             return jsonify({'message': 'Discussion post created successfully'})
         except Exception as e:
+            logger.error(f"Create discussion post error: {e}")
             return jsonify({'error': str(e)}), 500
 
 @app.route('/api/discussions/<post_id>/replies', methods=['GET', 'POST'])
@@ -1390,9 +2193,16 @@ def discussion_replies(post_id):
     
     if request.method == 'GET':
         try:
-            replies = list(db.discussion_replies.find({
-                'post_id': ObjectId(post_id)
-            }).sort('created_at', 1))
+            # Check fee payment for students
+            if session.get('role') == 'student':
+                if not check_fee_payment_status(db, session['user_id']):
+                    return jsonify({
+                        'error': 'Fee payment pending approval',
+                        'requires_fee_approval': True,
+                        'message': 'Please wait for fee payment approval to access discussions'
+                    }), 403
+            
+            replies = list(db.discussion_replies.find({'post_id': ObjectId(post_id)}).sort('created_at', 1))
             
             # Add author info
             for reply in replies:
@@ -1403,30 +2213,38 @@ def discussion_replies(post_id):
             
             return jsonify(serialize_list(replies))
         except Exception as e:
+            logger.error(f"Get discussion replies error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'POST':
         try:
+            # Check fee payment for students
+            if session.get('role') == 'student':
+                if not check_fee_payment_status(db, session['user_id']):
+                    return jsonify({
+                        'error': 'Fee payment pending approval',
+                        'requires_fee_approval': True,
+                        'message': 'Please wait for fee payment approval before replying to discussions'
+                    }), 403
+            
             data = request.json
             
-            # Verify user has access to the discussion
+            # Verify user can access this discussion
             post = db.discussion_posts.find_one({'_id': ObjectId(post_id)})
             if not post:
-                return jsonify({'error': 'Discussion post not found'}), 404
-            
-            course_id = post['course_id']
+                return jsonify({'error': 'Post not found'}), 404
             
             if session.get('role') == 'student':
                 enrollment = db.enrollments.find_one({
                     'student_id': ObjectId(session['user_id']),
-                    'course_id': course_id
+                    'course_id': post['course_id']
                 })
                 if not enrollment:
                     return jsonify({'error': 'You are not enrolled in this course'}), 403
             elif session.get('role') == 'teacher':
                 teacher_course = db.teacher_courses.find_one({
                     'teacher_id': ObjectId(session['user_id']),
-                    'course_id': course_id
+                    'course_id': post['course_id']
                 })
                 if not teacher_course:
                     return jsonify({'error': 'You are not assigned to this course'}), 403
@@ -1440,92 +2258,23 @@ def discussion_replies(post_id):
             
             db.discussion_replies.insert_one(reply)
             
-            # Create notification for post author
+            # Notify post author if they're not the one replying
             if str(post['user_id']) != session['user_id']:
+                post_author = db.users.find_one({'_id': post['user_id']})
+                reply_author = db.users.find_one({'_id': ObjectId(session['user_id'])})
+                
                 create_notification(
                     db,
                     str(post['user_id']),
-                    'New Reply',
-                    f'Someone replied to your discussion post: {post["title"]}',
-                    'discussion',
+                    'New Reply to Your Post',
+                    f'{reply_author.get("first_name", "Someone")} replied to your post "{post.get("title", "")}"',
+                    'discussion_reply',
                     post_id
                 )
             
             return jsonify({'message': 'Reply posted successfully'})
         except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-# ==============================================
-# MATERIALS ROUTES
-# ==============================================
-
-@app.route('/api/materials', methods=['GET', 'POST'])
-@login_required
-def materials():
-    db = get_db()
-    
-    if request.method == 'GET':
-        try:
-            course_id = request.args.get('course_id')
-            if not course_id:
-                return jsonify({'error': 'Course ID required'}), 400
-            
-            materials_list = list(db.materials.find({
-                'course_id': ObjectId(course_id)
-            }).sort('created_at', -1))
-            
-            # Add teacher info
-            for material in materials_list:
-                teacher = db.users.find_one({'_id': material['teacher_id']})
-                if teacher:
-                    material['teacher_name'] = f"{teacher.get('first_name', '')} {teacher.get('last_name', '')}"
-            
-            return jsonify(serialize_list(materials_list))
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    elif request.method == 'POST':
-        try:
-            data = request.json
-            
-            # Verify teacher is assigned to this course
-            if session.get('role') == 'teacher':
-                teacher_course = db.teacher_courses.find_one({
-                    'teacher_id': ObjectId(session['user_id']),
-                    'course_id': ObjectId(data['course_id'])
-                })
-                
-                if not teacher_course:
-                    return jsonify({'error': 'You are not assigned to this course'}), 403
-            
-            material = {
-                'course_id': ObjectId(data['course_id']),
-                'teacher_id': ObjectId(session['user_id']),
-                'title': data['title'],
-                'description': data.get('description', ''),
-                'material_type': data['material_type'],
-                'file_url': data.get('url', ''),
-                'created_at': datetime.utcnow()
-            }
-            
-            db.materials.insert_one(material)
-            
-            # Create notifications for enrolled students
-            enrollments = list(db.enrollments.find({'course_id': ObjectId(data['course_id'])}))
-            course = db.courses.find_one({'_id': ObjectId(data['course_id'])})
-            
-            for enrollment in enrollments:
-                create_notification(
-                    db,
-                    str(enrollment['student_id']),
-                    'New Course Material',
-                    f'New material added to {course.get("title", "Course")}: {data["title"]}',
-                    'material',
-                    str(material['_id'])
-                )
-            
-            return jsonify({'message': 'Material added successfully'})
-        except Exception as e:
+            logger.error(f"Create discussion reply error: {e}")
             return jsonify({'error': str(e)}), 500
 
 # ==============================================
@@ -1540,12 +2289,13 @@ def get_notifications(user_id):
             return jsonify({'error': 'Unauthorized'}), 403
         
         db = get_db()
-        notifications = list(db.notifications.find({
-            'user_id': ObjectId(user_id)
-        }).sort('created_at', -1))
+        notifications = list(db.notifications.find(
+            {'user_id': ObjectId(user_id)}
+        ).sort('created_at', -1))
         
         return jsonify(serialize_list(notifications))
     except Exception as e:
+        logger.error(f"Get notifications error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/notifications/<notification_id>/read', methods=['POST'])
@@ -1558,7 +2308,7 @@ def mark_notification_read(notification_id):
         if not notification:
             return jsonify({'error': 'Notification not found'}), 404
         
-        if str(notification['user_id']) != session['user_id']:
+        if str(notification['user_id']) != session['user_id'] and session.get('role') != 'admin':
             return jsonify({'error': 'Unauthorized'}), 403
         
         db.notifications.update_one(
@@ -1568,6 +2318,7 @@ def mark_notification_read(notification_id):
         
         return jsonify({'message': 'Notification marked as read'})
     except Exception as e:
+        logger.error(f"Mark notification read error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/notifications/<user_id>/read-all', methods=['POST'])
@@ -1578,6 +2329,7 @@ def mark_all_notifications_read(user_id):
             return jsonify({'error': 'Unauthorized'}), 403
         
         db = get_db()
+        
         db.notifications.update_many(
             {'user_id': ObjectId(user_id), 'is_read': False},
             {'$set': {'is_read': True}}
@@ -1585,6 +2337,7 @@ def mark_all_notifications_read(user_id):
         
         return jsonify({'message': 'All notifications marked as read'})
     except Exception as e:
+        logger.error(f"Mark all notifications read error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/notifications/<user_id>/clear-all', methods=['DELETE'])
@@ -1595,10 +2348,12 @@ def clear_all_notifications(user_id):
             return jsonify({'error': 'Unauthorized'}), 403
         
         db = get_db()
+        
         db.notifications.delete_many({'user_id': ObjectId(user_id)})
         
         return jsonify({'message': 'All notifications cleared'})
     except Exception as e:
+        logger.error(f"Clear all notifications error: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ==============================================
@@ -1610,25 +2365,24 @@ def clear_all_notifications(user_id):
 def admin_get_students():
     try:
         db = get_db()
+        
         students = list(db.users.find({'role': 'student'}).sort('created_at', -1))
+        
+        # Add fee payment status
+        for student in students:
+            fee_payment = db.fee_payments.find_one({
+                'student_id': student['_id'],
+                'status': 'approved'
+            })
+            student['has_approved_fee_payment'] = fee_payment is not None
+            
+            # Get enrolled courses count
+            enrollment_count = db.enrollments.count_documents({'student_id': student['_id']})
+            student['enrollment_count'] = enrollment_count
+        
         return jsonify(serialize_list(students))
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/admin/students/<student_id>/status', methods=['POST'])
-@admin_required
-def admin_update_student_status(student_id):
-    try:
-        data = request.json
-        db = get_db()
-        
-        db.users.update_one(
-            {'_id': ObjectId(student_id), 'role': 'student'},
-            {'$set': {'status': data['status']}}
-        )
-        
-        return jsonify({'message': 'Student status updated successfully'})
-    except Exception as e:
+        logger.error(f"Admin get students error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/students/<student_id>', methods=['PUT', 'DELETE'])
@@ -1642,8 +2396,8 @@ def admin_manage_student(student_id):
             
             update_data = {}
             allowed_fields = ['first_name', 'last_name', 'email', 'student_id', 
-                             'department', 'level', 'status', 'phone', 'address', 
-                             'gender', 'date_of_birth']
+                            'phone', 'address', 'date_of_birth', 'gender', 
+                            'department', 'level', 'status', 'fee_payment_required']
             
             for field in allowed_fields:
                 if field in data:
@@ -1653,30 +2407,48 @@ def admin_manage_student(student_id):
                 update_data['password'] = generate_password_hash(data['password'])
             
             db.users.update_one(
-                {'_id': ObjectId(student_id)},
+                {'_id': ObjectId(student_id), 'role': 'student'},
                 {'$set': update_data}
             )
             
             return jsonify({'message': 'Student updated successfully'})
         except Exception as e:
+            logger.error(f"Admin update student error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'DELETE':
         try:
-            # Delete student's enrollments
+            # Delete student and related data
+            db.users.delete_one({'_id': ObjectId(student_id), 'role': 'student'})
             db.enrollments.delete_many({'student_id': ObjectId(student_id)})
-            # Delete student's submissions
             db.submissions.delete_many({'student_id': ObjectId(student_id)})
-            # Delete student
-            db.users.delete_one({'_id': ObjectId(student_id)})
+            db.fee_payments.delete_many({'student_id': ObjectId(student_id)})
             
             return jsonify({'message': 'Student deleted successfully'})
         except Exception as e:
+            logger.error(f"Admin delete student error: {e}")
             return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/students/<student_id>/status', methods=['POST'])
+@admin_required
+def update_student_status(student_id):
+    try:
+        data = request.json
+        db = get_db()
+        
+        db.users.update_one(
+            {'_id': ObjectId(student_id), 'role': 'student'},
+            {'$set': {'status': data['status']}}
+        )
+        
+        return jsonify({'message': 'Student status updated successfully'})
+    except Exception as e:
+        logger.error(f"Update student status error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/teachers', methods=['GET', 'POST'])
 @admin_required
-def admin_manage_teachers():
+def admin_teachers():
     db = get_db()
     
     if request.method == 'GET':
@@ -1687,195 +2459,174 @@ def admin_manage_teachers():
             for teacher in teachers:
                 course_count = db.teacher_courses.count_documents({'teacher_id': teacher['_id']})
                 teacher['course_count'] = course_count
-                
-                # Get assigned courses
-                teacher_courses = list(db.teacher_courses.find({'teacher_id': teacher['_id']}))
-                course_ids = [tc['course_id'] for tc in teacher_courses]
-                courses = list(db.courses.find({'_id': {'$in': course_ids}}))
-                teacher['assigned_courses'] = serialize_list(courses)
             
             return jsonify(serialize_list(teachers))
         except Exception as e:
+            logger.error(f"Admin get teachers error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'POST':
         try:
             data = request.json
             
-            # Check if email already exists
-            existing_user = db.users.find_one({'email': data['email']})
-            if existing_user:
-                return jsonify({'error': 'Email already exists'}), 400
-            
             # Check if teacher code already exists
-            existing_code = db.users.find_one({'teacher_code': data.get('teacher_code')})
+            existing_code = db.users.find_one({'teacher_code': data['teacher_code']})
             if existing_code:
                 return jsonify({'error': 'Teacher code already exists'}), 400
             
-            # Hash password
-            hashed_password = generate_password_hash(data['password'])
+            # Check if email already exists
+            existing_email = db.users.find_one({'email': data['email']})
+            if existing_email:
+                return jsonify({'error': 'Email already exists'}), 400
             
-            # Create teacher document
-            teacher_data = {
+            teacher = {
                 'email': data['email'],
-                'password': hashed_password,
+                'password': generate_password_hash(data['password']),
                 'first_name': data['first_name'],
                 'last_name': data['last_name'],
                 'role': 'teacher',
                 'teacher_code': data['teacher_code'],
                 'department': data.get('department', ''),
-                'specialization': data.get('specialization', ''),
                 'status': 'active',
                 'created_at': datetime.utcnow()
             }
             
-            # Add optional fields if present
-            optional_fields = ['phone', 'address', 'date_of_birth', 'gender']
-            for field in optional_fields:
-                if field in data:
-                    teacher_data[field] = data[field]
-            
-            # Insert into database
-            result = db.users.insert_one(teacher_data)
-            teacher_id = str(result.inserted_id)
+            result = db.users.insert_one(teacher)
             
             return jsonify({
                 'message': 'Teacher account created successfully',
-                'teacher_id': teacher_id,
-                'teacher_code': data['teacher_code']
+                'teacher_id': str(result.inserted_id)
             }), 201
-            
-        except DuplicateKeyError as e:
-            return jsonify({'error': 'Duplicate key error. Email or teacher code already exists.'}), 400
         except Exception as e:
-            return jsonify({'error': f'Failed to create teacher account: {str(e)}'}), 500
+            logger.error(f"Admin create teacher error: {e}")
+            return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/teachers/<teacher_id>', methods=['GET', 'PUT', 'DELETE'])
+@admin_required
+def admin_teacher_detail(teacher_id):
+    db = get_db()
+    
+    if request.method == 'GET':
+        try:
+            teacher = db.users.find_one({'_id': ObjectId(teacher_id), 'role': 'teacher'})
+            if not teacher:
+                return jsonify({'error': 'Teacher not found'}), 404
+            
+            # Get teacher's courses
+            teacher_courses = list(db.teacher_courses.find({'teacher_id': ObjectId(teacher_id)}))
+            course_ids = [tc['course_id'] for tc in teacher_courses]
+            courses = list(db.courses.find({'_id': {'$in': course_ids}}))
+            
+            # Get teacher's announcements
+            announcements = list(db.announcements.find({'teacher_id': ObjectId(teacher_id)}).sort('created_at', -1).limit(10))
+            
+            # Get teacher's assignments
+            assignments = list(db.assignments.find({'teacher_id': ObjectId(teacher_id)}).sort('created_at', -1).limit(10))
+            
+            return jsonify({
+                'teacher': serialize_doc(teacher),
+                'courses': serialize_list(courses),
+                'announcements': serialize_list(announcements),
+                'assignments': serialize_list(assignments)
+            })
+        except Exception as e:
+            logger.error(f"Admin get teacher detail error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'PUT':
+        try:
+            data = request.json
+            
+            update_data = {}
+            allowed_fields = ['first_name', 'last_name', 'email', 'teacher_code', 
+                            'department', 'specialization', 'phone', 'address', 
+                            'date_of_birth', 'gender', 'status']
+            
+            for field in allowed_fields:
+                if field in data:
+                    update_data[field] = data[field]
+            
+            if 'password' in data and data['password']:
+                update_data['password'] = generate_password_hash(data['password'])
+            
+            db.users.update_one(
+                {'_id': ObjectId(teacher_id), 'role': 'teacher'},
+                {'$set': update_data}
+            )
+            
+            return jsonify({'message': 'Teacher updated successfully'})
+        except Exception as e:
+            logger.error(f"Admin update teacher error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'DELETE':
+        try:
+            # Delete teacher and related data
+            db.users.delete_one({'_id': ObjectId(teacher_id), 'role': 'teacher'})
+            db.teacher_courses.delete_many({'teacher_id': ObjectId(teacher_id)})
+            db.announcements.delete_many({'teacher_id': ObjectId(teacher_id)})
+            db.assignments.delete_many({'teacher_id': ObjectId(teacher_id)})
+            db.materials.delete_many({'teacher_id': ObjectId(teacher_id)})
+            
+            return jsonify({'message': 'Teacher deleted successfully'})
+        except Exception as e:
+            logger.error(f"Admin delete teacher error: {e}")
+            return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/teachers/<teacher_id>/details', methods=['GET'])
 @admin_required
-def admin_get_teacher_details(teacher_id):
+def admin_teacher_details(teacher_id):
     try:
         db = get_db()
         
-        # Get teacher info
-        teacher = db.users.find_one({'_id': ObjectId(teacher_id)})
+        teacher = db.users.find_one({'_id': ObjectId(teacher_id), 'role': 'teacher'})
         if not teacher:
             return jsonify({'error': 'Teacher not found'}), 404
         
-        # Get assigned courses
+        # Get teacher's courses
         teacher_courses = list(db.teacher_courses.find({'teacher_id': ObjectId(teacher_id)}))
         course_ids = [tc['course_id'] for tc in teacher_courses]
         courses = list(db.courses.find({'_id': {'$in': course_ids}}))
         
-        # Get recent announcements by this teacher
-        recent_announcements = list(db.announcements.find(
-            {'teacher_id': ObjectId(teacher_id)}).sort('created_at', -1).limit(5))
+        # Get teacher's announcements
+        announcements = list(db.announcements.find({'teacher_id': ObjectId(teacher_id)}).sort('created_at', -1).limit(10))
         
-        # Get recent assignments by this teacher
-        recent_assignments = list(db.assignments.find(
-            {'teacher_id': ObjectId(teacher_id)}).sort('created_at', -1).limit(5))
+        # Get teacher's assignments
+        assignments = list(db.assignments.find({'teacher_id': ObjectId(teacher_id)}).sort('created_at', -1).limit(10))
         
         return jsonify({
             'teacher': serialize_doc(teacher),
             'courses': serialize_list(courses),
-            'announcements': serialize_list(recent_announcements),
-            'assignments': serialize_list(recent_assignments)
+            'announcements': serialize_list(announcements),
+            'assignments': serialize_list(assignments)
         })
     except Exception as e:
-        return jsonify({'error': f'Failed to fetch teacher details: {str(e)}'}), 500
-
-@app.route('/api/admin/teachers/<teacher_id>', methods=['PUT', 'DELETE'])
-@admin_required
-def admin_update_teacher(teacher_id):
-    db = get_db()
-    
-    if request.method == 'PUT':
-        try:
-            data = request.json
-            
-            # Check if teacher exists
-            teacher = db.users.find_one({'_id': ObjectId(teacher_id), 'role': 'teacher'})
-            if not teacher:
-                return jsonify({'error': 'Teacher not found'}), 404
-            
-            # Update data
-            update_data = {}
-            
-            # Basic fields
-            basic_fields = ['first_name', 'last_name', 'email', 'teacher_code', 
-                           'department', 'specialization', 'phone', 'address', 
-                           'date_of_birth', 'gender', 'status']
-            
-            for field in basic_fields:
-                if field in data:
-                    update_data[field] = data[field]
-            
-            # Update password if provided
-            if 'password' in data and data['password']:
-                update_data['password'] = generate_password_hash(data['password'])
-            
-            # Check for duplicate email
-            if 'email' in update_data:
-                existing_email = db.users.find_one({
-                    'email': update_data['email'],
-                    '_id': {'$ne': ObjectId(teacher_id)}
-                })
-                if existing_email:
-                    return jsonify({'error': 'Email already in use by another user'}), 400
-            
-            # Check for duplicate teacher code
-            if 'teacher_code' in update_data:
-                existing_code = db.users.find_one({
-                    'teacher_code': update_data['teacher_code'],
-                    '_id': {'$ne': ObjectId(teacher_id)}
-                })
-                if existing_code:
-                    return jsonify({'error': 'Teacher code already in use by another teacher'}), 400
-            
-            # Update teacher
-            db.users.update_one(
-                {'_id': ObjectId(teacher_id)},
-                {'$set': update_data}
-            )
-            
-            return jsonify({'message': 'Teacher account updated successfully'})
-        except Exception as e:
-            return jsonify({'error': f'Failed to update teacher: {str(e)}'}), 500
-    
-    elif request.method == 'DELETE':
-        try:
-            # Check if teacher exists
-            teacher = db.users.find_one({'_id': ObjectId(teacher_id), 'role': 'teacher'})
-            if not teacher:
-                return jsonify({'error': 'Teacher not found'}), 404
-            
-            # Remove teacher from all courses
-            db.teacher_courses.delete_many({'teacher_id': ObjectId(teacher_id)})
-            
-            # Delete teacher account
-            db.users.delete_one({'_id': ObjectId(teacher_id)})
-            
-            return jsonify({'message': 'Teacher account deleted successfully'})
-        except Exception as e:
-            return jsonify({'error': f'Failed to delete teacher: {str(e)}'}), 500
+        logger.error(f"Admin get teacher details error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/courses', methods=['GET', 'POST'])
 @admin_required
-def admin_manage_courses():
+def admin_courses():
     db = get_db()
     
     if request.method == 'GET':
         try:
             courses = list(db.courses.find().sort('created_at', -1))
             
-            # Add teacher info for each course
+            # Get teacher names for each course
             for course in courses:
                 teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
                 teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
                 teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
                 course['teacher_names'] = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers])
+                
+                # Get enrollment count
+                enrollment_count = db.enrollments.count_documents({'course_id': course['_id']})
+                course['enrollment_count'] = enrollment_count
             
             return jsonify(serialize_list(courses))
         except Exception as e:
+            logger.error(f"Admin get courses error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'POST':
@@ -1883,15 +2634,15 @@ def admin_manage_courses():
             data = request.json
             
             # Check if course code already exists
-            existing_course = db.courses.find_one({'course_code': data['course_code']})
-            if existing_course:
+            existing = db.courses.find_one({'course_code': data['course_code']})
+            if existing:
                 return jsonify({'error': 'Course code already exists'}), 400
             
-            course_data = {
+            course = {
                 'title': data['title'],
                 'course_code': data['course_code'],
-                'description': data.get('description', ''),
-                'credits': data['credits'],
+                'description': data['description'],
+                'credits': int(data['credits']),
                 'teacher_lock': bool(data.get('teacher_lock', True)),
                 'status': 'active',
                 'level': data.get('level', 'all'),
@@ -1900,43 +2651,99 @@ def admin_manage_courses():
                 'created_at': datetime.utcnow()
             }
             
-            result = db.courses.insert_one(course_data)
+            result = db.courses.insert_one(course)
+            
+            # Auto-enroll students if it's a compulsory course
+            if course['is_compulsory'] and course['level'] != 'all':
+                # Find students in this level
+                students = list(db.users.find({
+                    'role': 'student',
+                    'level': course['level']
+                }))
+                
+                enrollments_to_insert = []
+                for student in students:
+                    enrollments_to_insert.append({
+                        'student_id': student['_id'],
+                        'course_id': result.inserted_id,
+                        'enrolled_at': datetime.utcnow()
+                    })
+                
+                if enrollments_to_insert:
+                    try:
+                        db.enrollments.insert_many(enrollments_to_insert, ordered=False)
+                    except:
+                        pass
+                
+                # Create notifications for enrolled students
+                for student in students:
+                    create_notification(
+                        db,
+                        str(student['_id']),
+                        'Auto-enrolled in Compulsory Course',
+                        f'You have been auto-enrolled in compulsory course: {course["title"]}',
+                        'enrollment',
+                        str(result.inserted_id)
+                    )
             
             return jsonify({
                 'message': 'Course created successfully',
-                'course_id': str(result.inserted_id)
+                'course_id': str(result.inserted_id),
+                'auto_enrolled_count': len(students) if course.get('is_compulsory') else 0
             }), 201
         except Exception as e:
+            logger.error(f"Admin create course error: {e}")
             return jsonify({'error': str(e)}), 500
 
-@app.route('/api/admin/courses/<course_id>', methods=['PUT', 'DELETE'])
+@app.route('/api/admin/courses/<course_id>', methods=['GET', 'PUT', 'DELETE'])
 @admin_required
-def admin_update_course(course_id):
+def admin_course_detail(course_id):
     db = get_db()
     
-    if request.method == 'PUT':
+    if request.method == 'GET':
+        try:
+            course = db.courses.find_one({'_id': ObjectId(course_id)})
+            if not course:
+                return jsonify({'error': 'Course not found'}), 404
+            
+            # Get teacher names
+            teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
+            teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
+            teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
+            course['teacher_names'] = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers])
+            
+            # Get enrollment count
+            enrollment_count = db.enrollments.count_documents({'course_id': course['_id']})
+            course['enrollment_count'] = enrollment_count
+            
+            # Get enrolled students
+            enrollments = list(db.enrollments.find({'course_id': course['_id']}))
+            student_ids = [e['student_id'] for e in enrollments]
+            students = list(db.users.find({'_id': {'$in': student_ids}}))
+            course['students'] = serialize_list(students)
+            
+            return jsonify(serialize_doc(course))
+        except Exception as e:
+            logger.error(f"Admin get course detail error: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    elif request.method == 'PUT':
         try:
             data = request.json
             
             update_data = {}
             allowed_fields = ['title', 'course_code', 'description', 'credits', 
-                             'teacher_lock', 'status', 'level', 'department', 'is_compulsory']
+                            'teacher_lock', 'status', 'level', 'department', 
+                            'is_compulsory']
             
             for field in allowed_fields:
                 if field in data:
-                    if field == 'teacher_lock':
+                    if field in ['credits', 'teacher_lock']:
+                        update_data[field] = int(data[field]) if data[field] else 0
+                    elif field == 'is_compulsory':
                         update_data[field] = bool(data[field])
                     else:
                         update_data[field] = data[field]
-            
-            # Check for duplicate course code
-            if 'course_code' in update_data:
-                existing_course = db.courses.find_one({
-                    'course_code': update_data['course_code'],
-                    '_id': {'$ne': ObjectId(course_id)}
-                })
-                if existing_course:
-                    return jsonify({'error': 'Course code already in use by another course'}), 400
             
             db.courses.update_one(
                 {'_id': ObjectId(course_id)},
@@ -1945,6 +2752,7 @@ def admin_update_course(course_id):
             
             return jsonify({'message': 'Course updated successfully'})
         except Exception as e:
+            logger.error(f"Admin update course error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'DELETE':
@@ -1953,72 +2761,29 @@ def admin_update_course(course_id):
             enrollment_count = db.enrollments.count_documents({'course_id': ObjectId(course_id)})
             
             if enrollment_count > 0:
-                # Deactivate course instead of deleting
+                # Instead of deleting, deactivate the course
                 db.courses.update_one(
                     {'_id': ObjectId(course_id)},
                     {'$set': {'status': 'inactive'}}
                 )
+                
                 return jsonify({
-                    'deactivated': True,
-                    'message': 'Course deactivated (has active enrollments)'
+                    'message': 'Course deactivated (has active enrollments)',
+                    'deactivated': True
                 })
             else:
                 # Delete course and related data
+                db.courses.delete_one({'_id': ObjectId(course_id)})
                 db.teacher_courses.delete_many({'course_id': ObjectId(course_id)})
                 db.announcements.delete_many({'course_id': ObjectId(course_id)})
                 db.assignments.delete_many({'course_id': ObjectId(course_id)})
                 db.materials.delete_many({'course_id': ObjectId(course_id)})
                 db.discussion_posts.delete_many({'course_id': ObjectId(course_id)})
-                db.courses.delete_one({'_id': ObjectId(course_id)})
                 
                 return jsonify({'message': 'Course deleted successfully'})
         except Exception as e:
+            logger.error(f"Admin delete course error: {e}")
             return jsonify({'error': str(e)}), 500
-
-@app.route('/api/courses/<course_id>/admin-details', methods=['GET'])
-@admin_required
-def get_course_admin_details(course_id):
-    try:
-        print(f"=== GET COURSE ADMIN DETAILS ===")
-        print(f"Course ID received: {course_id}")
-        
-        db = get_db()
-        
-        # Try to find by ObjectId
-        try:
-            obj_id = ObjectId(course_id)
-            course = db.courses.find_one({'_id': obj_id})
-        except:
-            print(f"Failed to convert to ObjectId: {course_id}")
-            course = None
-        
-        if not course:
-            print(f"Course not found: {course_id}")
-            return jsonify({'error': 'Course not found'}), 404
-        
-        print(f"Course found: {course.get('title')}")
-        
-        # Get teacher info
-        teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
-        teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
-        teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
-        course['teacher_names'] = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers])
-        
-        # Get enrollment count
-        enrollment_count = db.enrollments.count_documents({'course_id': course['_id']})
-        course['enrollment_count'] = enrollment_count
-        
-        # Serialize the course
-        serialized_course = serialize_doc(course)
-        
-        return jsonify(serialized_course)
-        
-    except Exception as e:
-        print(f"=== ERROR IN GET COURSE ADMIN DETAILS ===")
-        print(f"Error: {str(e)}")
-        import traceback
-        print(f"Traceback: {traceback.format_exc()}")
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/compulsory-courses', methods=['GET', 'POST', 'PUT'])
 @admin_required
@@ -2027,34 +2792,32 @@ def admin_compulsory_courses():
     
     if request.method == 'GET':
         try:
-            # Group compulsory courses by level
-            compulsory_courses = list(db.courses.find({'is_compulsory': True}).sort('level', 1))
+            courses = list(db.courses.find({'is_compulsory': True}).sort('level', 1))
             
-            courses_by_level = {}
-            for course in compulsory_courses:
-                level = course.get('level', 'Unknown')
-                if level not in courses_by_level:
-                    courses_by_level[level] = []
-                courses_by_level[level].append(serialize_doc(course))
+            # Get enrollment counts
+            for course in courses:
+                enrollment_count = db.enrollments.count_documents({'course_id': course['_id']})
+                course['enrollment_count'] = enrollment_count
             
-            return jsonify(courses_by_level)
+            return jsonify(serialize_list(courses))
         except Exception as e:
+            logger.error(f"Admin get compulsory courses error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'POST':
         try:
             data = request.json
             
-            # Check if course code exists
-            existing_course = db.courses.find_one({'course_code': data['course_code']})
-            if existing_course:
+            # Check if course code already exists
+            existing = db.courses.find_one({'course_code': data['course_code']})
+            if existing:
                 return jsonify({'error': 'Course code already exists'}), 400
             
-            course_data = {
+            course = {
                 'title': data['title'],
                 'course_code': data['course_code'],
                 'description': data.get('description', ''),
-                'credits': data['credits'],
+                'credits': int(data['credits']),
                 'teacher_lock': True,
                 'status': 'active',
                 'level': data['level'],
@@ -2063,47 +2826,53 @@ def admin_compulsory_courses():
                 'created_at': datetime.utcnow()
             }
             
-            result = db.courses.insert_one(course_data)
-            course_id = result.inserted_id
+            result = db.courses.insert_one(course)
             
             # Auto-enroll students in this level
-            if data.get('auto_enroll', True):
-                students = list(db.users.find({
-                    'role': 'student',
-                    'level': data['level']
-                }))
-                
-                enrollments = []
-                for student in students:
-                    enrollments.append({
-                        'student_id': student['_id'],
-                        'course_id': course_id,
-                        'enrolled_at': datetime.utcnow()
-                    })
-                
-                if enrollments:
-                    try:
-                        db.enrollments.insert_many(enrollments, ordered=False)
-                    except:
-                        pass  # Some students might already be enrolled
-                
-                return jsonify({
-                    'message': f'Compulsory course created and {len(students)} students auto-enrolled',
-                    'auto_enrolled_count': len(students)
+            students = list(db.users.find({
+                'role': 'student',
+                'level': course['level']
+            }))
+            
+            enrollments_to_insert = []
+            for student in students:
+                enrollments_to_insert.append({
+                    'student_id': student['_id'],
+                    'course_id': result.inserted_id,
+                    'enrolled_at': datetime.utcnow()
                 })
+            
+            if enrollments_to_insert:
+                try:
+                    db.enrollments.insert_many(enrollments_to_insert, ordered=False)
+                except:
+                    pass
+            
+            # Create notifications for enrolled students
+            for student in students:
+                create_notification(
+                    db,
+                    str(student['_id']),
+                    'Auto-enrolled in Compulsory Course',
+                    f'You have been auto-enrolled in compulsory course: {course["title"]}',
+                    'enrollment',
+                    str(result.inserted_id)
+                )
             
             return jsonify({
                 'message': 'Compulsory course created successfully',
-                'auto_enrolled_count': 0
-            })
+                'course_id': str(result.inserted_id),
+                'auto_enrolled_count': len(students)
+            }), 201
         except Exception as e:
+            logger.error(f"Admin create compulsory course error: {e}")
             return jsonify({'error': str(e)}), 500
     
     elif request.method == 'PUT':
         try:
             data = request.json
-            course_id = data.get('id')
             
+            course_id = data.get('id')
             if not course_id:
                 return jsonify({'error': 'Course ID required'}), 400
             
@@ -2112,29 +2881,24 @@ def admin_compulsory_courses():
             
             for field in allowed_fields:
                 if field in data:
-                    update_data[field] = data[field]
-            
-            # Check for duplicate course code
-            if 'course_code' in update_data:
-                existing_course = db.courses.find_one({
-                    'course_code': update_data['course_code'],
-                    '_id': {'$ne': ObjectId(course_id)}
-                })
-                if existing_course:
-                    return jsonify({'error': 'Course code already in use by another course'}), 400
+                    if field == 'credits':
+                        update_data[field] = int(data[field])
+                    else:
+                        update_data[field] = data[field]
             
             db.courses.update_one(
-                {'_id': ObjectId(course_id)},
+                {'_id': ObjectId(course_id), 'is_compulsory': True},
                 {'$set': update_data}
             )
             
             return jsonify({'message': 'Compulsory course updated successfully'})
         except Exception as e:
+            logger.error(f"Admin update compulsory course error: {e}")
             return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/compulsory-courses/<course_id>', methods=['DELETE'])
 @admin_required
-def admin_delete_compulsory_course(course_id):
+def delete_compulsory_course(course_id):
     try:
         db = get_db()
         
@@ -2143,7 +2907,7 @@ def admin_delete_compulsory_course(course_id):
         if not course:
             return jsonify({'error': 'Compulsory course not found'}), 404
         
-        # Remove enrollments for this course
+        # Delete enrollments for this course
         db.enrollments.delete_many({'course_id': ObjectId(course_id)})
         
         # Delete the course
@@ -2151,65 +2915,26 @@ def admin_delete_compulsory_course(course_id):
         
         return jsonify({'message': 'Compulsory course deleted successfully'})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/admin/departments/courses', methods=['GET'])
-@admin_required
-def admin_get_department_courses():
-    try:
-        department = request.args.get('department')
-        level = request.args.get('level')
-        
-        if not department or not level:
-            return jsonify({'error': 'Department and level required'}), 400
-        
-        db = get_db()
-        
-        query = {
-            'department': department,
-            'level': level,
-            'is_compulsory': False
-        }
-        
-        courses = list(db.courses.find(query).sort('created_at', -1))
-        
-        # Add additional info for each course
-        for course in courses:
-            # Get teacher info
-            teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
-            teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
-            teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
-            course['teacher_names'] = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers])
-            
-            # Get enrollment count
-            enrollment_count = db.enrollments.count_documents({'course_id': course['_id']})
-            course['enrolled_students'] = enrollment_count
-        
-        return jsonify(serialize_list(courses))
-    except Exception as e:
+        logger.error(f"Admin delete compulsory course error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/departments/deploy-courses', methods=['POST'])
 @admin_required
-def admin_deploy_department_courses():
+def deploy_department_courses():
     try:
         data = request.json
         db = get_db()
         
         department = data['department']
         level = data['level']
-        courses_data = data['courses']
+        courses = data['courses']
         
         deployed_courses = []
-        auto_enrolled_count = 0
+        auto_enrolled_students = 0
         
-        for course_data in courses_data:
-            # Check if course already exists
-            existing_course = db.courses.find_one({
-                'course_code': course_data['code'],
-                'department': department,
-                'level': level
-            })
+        for course_data in courses:
+            # Check if course already exists with this code
+            existing_course = db.courses.find_one({'course_code': course_data['code']})
             
             if existing_course:
                 # Update existing course
@@ -2219,19 +2944,20 @@ def admin_deploy_department_courses():
                         'title': course_data['title'],
                         'description': course_data['description'],
                         'credits': course_data['credits'],
-                        'teacher_lock': course_data.get('teacher_lock', True),
+                        'department': department,
+                        'level': level,
                         'status': 'active'
                     }}
                 )
                 course_id = existing_course['_id']
             else:
                 # Create new course
-                course_doc = {
+                course = {
                     'title': course_data['title'],
                     'course_code': course_data['code'],
                     'description': course_data['description'],
                     'credits': course_data['credits'],
-                    'teacher_lock': course_data.get('teacher_lock', True),
+                    'teacher_lock': True,
                     'status': 'active',
                     'level': level,
                     'department': department,
@@ -2239,10 +2965,10 @@ def admin_deploy_department_courses():
                     'created_at': datetime.utcnow()
                 }
                 
-                result = db.courses.insert_one(course_doc)
+                result = db.courses.insert_one(course)
                 course_id = result.inserted_id
             
-            # For HS levels, auto-enroll students
+            # Auto-enroll high school students in their department courses
             if level.startswith('HS'):
                 students = list(db.users.find({
                     'role': 'student',
@@ -2250,6 +2976,7 @@ def admin_deploy_department_courses():
                     'department': department
                 }))
                 
+                enrollments_to_insert = []
                 for student in students:
                     # Check if already enrolled
                     existing_enrollment = db.enrollments.find_one({
@@ -2258,63 +2985,322 @@ def admin_deploy_department_courses():
                     })
                     
                     if not existing_enrollment:
-                        enrollment = {
+                        enrollments_to_insert.append({
                             'student_id': student['_id'],
                             'course_id': course_id,
                             'enrolled_at': datetime.utcnow()
-                        }
-                        try:
-                            db.enrollments.insert_one(enrollment)
-                            auto_enrolled_count += 1
-                        except:
-                            pass  # Student might already be enrolled
+                        })
+                
+                if enrollments_to_insert:
+                    try:
+                        db.enrollments.insert_many(enrollments_to_insert, ordered=False)
+                        auto_enrolled_students += len(enrollments_to_insert)
+                        
+                        # Create notifications for enrolled students
+                        for enrollment in enrollments_to_insert:
+                            create_notification(
+                                db,
+                                str(enrollment['student_id']),
+                                'Auto-enrolled in Department Course',
+                                f'You have been auto-enrolled in department course: {course_data["title"]}',
+                                'enrollment',
+                                str(course_id)
+                            )
+                    except:
+                        pass
             
-            deployed_courses.append(course_data['title'])
+            deployed_courses.append({
+                'title': course_data['title'],
+                'code': course_data['code'],
+                'id': str(course_id)
+            })
         
         return jsonify({
-            'message': f'Successfully deployed {len(deployed_courses)} courses for {department} department ({level})',
+            'message': f'{len(deployed_courses)} courses deployed successfully for {department} department ({level})',
             'deployed_courses': deployed_courses,
-            'auto_enrolled_students': auto_enrolled_count
+            'auto_enrolled_students': auto_enrolled_students
         })
     except Exception as e:
+        logger.error(f"Admin deploy department courses error: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/admin/clear-all-courses', methods=['DELETE'])
+@app.route('/api/admin/departments/courses', methods=['GET'])
 @admin_required
-def admin_clear_all_courses():
+def get_department_courses():
     try:
         db = get_db()
         
-        # Count before deletion
-        course_count = db.courses.count_documents({})
+        department = request.args.get('department')
+        level = request.args.get('level')
         
-        # Delete all courses and related data
-        db.courses.delete_many({})
-        db.teacher_courses.delete_many({})
-        db.enrollments.delete_many({})
-        db.announcements.delete_many({})
-        db.assignments.delete_many({})
-        db.submissions.delete_many({})
-        db.materials.delete_many({})
-        db.discussion_posts.delete_many({})
-        db.discussion_replies.delete_many({})
+        query = {'is_compulsory': False}
         
-        return jsonify({
-            'message': f'Successfully cleared all {course_count} courses and related data',
-            'courses_cleared': course_count
-        })
+        if department:
+            query['department'] = department
+        if level:
+            query['level'] = level
+        
+        courses = list(db.courses.find(query).sort('created_at', -1))
+        
+        # Add enrollment counts and teacher names
+        for course in courses:
+            enrollment_count = db.enrollments.count_documents({'course_id': course['_id']})
+            course['enrolled_students'] = enrollment_count
+            
+            teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
+            teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
+            teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
+            course['teacher_names'] = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers])
+        
+        return jsonify(serialize_list(courses))
     except Exception as e:
+        logger.error(f"Admin get department courses error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/announcements', methods=['POST'])
+@admin_required
+def admin_create_announcement():
+    try:
+        data = request.json
+        db = get_db()
+        
+        announcement = {
+            'title': data['title'],
+            'content': data['content'],
+            'target': data['target'],  # 'teachers' or 'students'
+            'admin_id': ObjectId(session['user_id']),
+            'created_at': datetime.utcnow()
+        }
+        
+        db.admin_announcements.insert_one(announcement)
+        
+        # Get admin name
+        admin = db.users.find_one({'_id': ObjectId(session['user_id'])})
+        admin_name = f"{admin.get('first_name', '')} {admin.get('last_name', '')}"
+        
+        # Create notifications for target users
+        if data['target'] == 'teachers':
+            teachers = list(db.users.find({'role': 'teacher', 'status': 'active'}))
+            for teacher in teachers:
+                create_notification(
+                    db,
+                    str(teacher['_id']),
+                    f'Admin Announcement: {data["title"]}',
+                    data['content'],
+                    'admin_announcement',
+                    str(announcement['_id'])
+                )
+        elif data['target'] == 'students':
+            students = list(db.users.find({'role': 'student', 'status': 'active'}))
+            for student in students:
+                create_notification(
+                    db,
+                    str(student['_id']),
+                    f'Admin Announcement: {data["title"]}',
+                    data['content'],
+                    'admin_announcement',
+                    str(announcement['_id'])
+                )
+        
+        return jsonify({'message': 'Announcement sent successfully'})
+    except Exception as e:
+        logger.error(f"Admin create announcement error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/announcements/recent', methods=['GET'])
+@admin_required
+def get_recent_admin_announcements():
+    try:
+        db = get_db()
+        
+        announcements = list(db.admin_announcements.find().sort('created_at', -1).limit(10))
+        
+        # Add admin names
+        for ann in announcements:
+            admin = db.users.find_one({'_id': ann['admin_id']})
+            if admin:
+                ann['admin_name'] = f"{admin.get('first_name', '')} {admin.get('last_name', '')}"
+        
+        return jsonify(serialize_list(announcements))
+    except Exception as e:
+        logger.error(f"Admin get recent announcements error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/pending-approvals', methods=['GET'])
+@admin_required
+def get_pending_approvals():
+    try:
+        db = get_db()
+        
+        approvals = list(db.course_approval_requests.find({'status': 'pending'}))
+        
+        result = []
+        for approval in approvals:
+            teacher = db.users.find_one({'_id': approval['teacher_id']})
+            course = db.courses.find_one({'_id': approval['course_id']})
+            current_teacher = None
+            
+            if approval.get('current_teacher_id'):
+                current_teacher_doc = db.users.find_one({'_id': approval['current_teacher_id']})
+                if current_teacher_doc:
+                    current_teacher = f"{current_teacher_doc.get('first_name', '')} {current_teacher_doc.get('last_name', '')}"
+            
+            result.append({
+                'request_id': str(approval['_id']),
+                'teacher_id': str(approval['teacher_id']),
+                'teacher_first_name': teacher.get('first_name', ''),
+                'teacher_last_name': teacher.get('last_name', ''),
+                'teacher_code': teacher.get('teacher_code', ''),
+                'course_id': str(approval['course_id']),
+                'course_title': course.get('title', ''),
+                'course_code': course.get('course_code', ''),
+                'current_teacher': current_teacher or 'Not assigned',
+                'requested_at': approval['requested_at']
+            })
+        
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Admin get pending approvals error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/approval-history', methods=['GET'])
+@admin_required
+def get_approval_history():
+    try:
+        db = get_db()
+        
+        approvals = list(db.course_approval_requests.find().sort('requested_at', -1).limit(50))
+        
+        result = []
+        for approval in approvals:
+            teacher = db.users.find_one({'_id': approval['teacher_id']})
+            course = db.courses.find_one({'_id': approval['course_id']})
+            admin = db.users.find_one({'_id': approval.get('admin_id')}) if approval.get('admin_id') else None
+            
+            result.append({
+                'teacher_first_name': teacher.get('first_name', ''),
+                'teacher_last_name': teacher.get('last_name', ''),
+                'course_title': course.get('title', ''),
+                'status': approval.get('status', 'pending'),
+                'requested_at': approval['requested_at'],
+                'reviewed_at': approval.get('reviewed_at'),
+                'admin_name': f"{admin.get('first_name', '')} {admin.get('last_name', '')}" if admin else 'N/A',
+                'admin_notes': approval.get('admin_notes', '')
+            })
+        
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Admin get approval history error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/approve-course-request/<request_id>', methods=['POST'])
+@admin_required
+def approve_course_request(request_id):
+    try:
+        data = request.json
+        db = get_db()
+        
+        approval_request = db.course_approval_requests.find_one({'_id': ObjectId(request_id)})
+        if not approval_request:
+            return jsonify({'error': 'Approval request not found'}), 404
+        
+        if data.get('action') == 'approve':
+            # Check if course is already assigned to another teacher
+            existing_teacher = db.teacher_courses.find_one({
+                'course_id': approval_request['course_id']
+            })
+            
+            if existing_teacher and existing_teacher['teacher_id'] != approval_request['teacher_id']:
+                if not data.get('reassign'):
+                    return jsonify({
+                        'error': 'Course already assigned to another teacher',
+                        'current_teacher': str(existing_teacher['teacher_id']),
+                        'course_title': db.courses.find_one({'_id': approval_request['course_id']}).get('title', '')
+                    }), 400
+                
+                # Remove existing teacher assignment
+                db.teacher_courses.delete_one({
+                    'teacher_id': existing_teacher['teacher_id'],
+                    'course_id': approval_request['course_id']
+                })
+            
+            # Assign course to requesting teacher
+            teacher_course = {
+                'teacher_id': approval_request['teacher_id'],
+                'course_id': approval_request['course_id'],
+                'assigned_at': datetime.utcnow()
+            }
+            
+            db.teacher_courses.insert_one(teacher_course)
+            
+            # Update approval request
+            db.course_approval_requests.update_one(
+                {'_id': ObjectId(request_id)},
+                {'$set': {
+                    'status': 'approved',
+                    'admin_id': ObjectId(session['user_id']),
+                    'reviewed_at': datetime.utcnow(),
+                    'admin_notes': data.get('notes', 'Approved by admin')
+                }}
+            )
+            
+            # Notify teacher
+            teacher = db.users.find_one({'_id': approval_request['teacher_id']})
+            course = db.courses.find_one({'_id': approval_request['course_id']})
+            
+            create_notification(
+                db,
+                str(approval_request['teacher_id']),
+                'Course Request Approved',
+                f'Your request to teach {course.get("title", "Course")} has been approved.',
+                'approval',
+                request_id
+            )
+            
+            return jsonify({'message': 'Course request approved successfully'})
+        
+        elif data.get('action') == 'reject':
+            # Update approval request
+            db.course_approval_requests.update_one(
+                {'_id': ObjectId(request_id)},
+                {'$set': {
+                    'status': 'rejected',
+                    'admin_id': ObjectId(session['user_id']),
+                    'reviewed_at': datetime.utcnow(),
+                    'admin_notes': data.get('notes', 'Rejected by admin')
+                }}
+            )
+            
+            # Notify teacher
+            teacher = db.users.find_one({'_id': approval_request['teacher_id']})
+            course = db.courses.find_one({'_id': approval_request['course_id']})
+            
+            create_notification(
+                db,
+                str(approval_request['teacher_id']),
+                'Course Request Rejected',
+                f'Your request to teach {course.get("title", "Course")} has been rejected. Reason: {data.get("notes", "No reason provided")}',
+                'approval',
+                request_id
+            )
+            
+            return jsonify({'message': 'Course request rejected successfully'})
+        
+        else:
+            return jsonify({'error': 'Invalid action'}), 400
+            
+    except Exception as e:
+        logger.error(f"Admin approve course request error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/enrollments', methods=['GET'])
 @admin_required
-def admin_get_all_enrollments():
+def admin_get_enrollments():
     try:
         db = get_db()
         
         enrollments = list(db.enrollments.find().sort('enrolled_at', -1))
         
-        # Add student and course info
         result = []
         for enrollment in enrollments:
             student = db.users.find_one({'_id': enrollment['student_id']})
@@ -2323,61 +3309,63 @@ def admin_get_all_enrollments():
             if student and course:
                 result.append({
                     'id': str(enrollment['_id']),
+                    'student_id': str(student['_id']),
                     'first_name': student.get('first_name', ''),
                     'last_name': student.get('last_name', ''),
-                    'student_id': student.get('student_id', ''),
-                    'email': student.get('email', ''),
-                    'level': student.get('level', ''),
-                    'department': student.get('department', ''),
+                    'student_id_display': student.get('student_id', ''),
+                    'course_id': str(course['_id']),
                     'course_title': course.get('title', ''),
                     'course_code': course.get('course_code', ''),
-                    'enrolled_at': enrollment.get('enrolled_at')
+                    'level': student.get('level', ''),
+                    'department': student.get('department', ''),
+                    'enrolled_at': enrollment['enrolled_at']
                 })
         
         return jsonify(result)
     except Exception as e:
+        logger.error(f"Admin get enrollments error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/enrollments/search', methods=['GET'])
 @admin_required
-def admin_search_enrollments():
+def search_enrollments():
     try:
-        search_term = request.args.get('q', '')
+        search_term = request.args.get('q', '').lower()
         db = get_db()
         
-        # Search in students and courses
-        students = list(db.users.find({
+        # Search students by name, ID, or email
+        student_query = {
             'role': 'student',
             '$or': [
                 {'first_name': {'$regex': search_term, '$options': 'i'}},
                 {'last_name': {'$regex': search_term, '$options': 'i'}},
-                {'email': {'$regex': search_term, '$options': 'i'}},
-                {'student_id': {'$regex': search_term, '$options': 'i'}}
+                {'student_id': {'$regex': search_term, '$options': 'i'}},
+                {'email': {'$regex': search_term, '$options': 'i'}}
             ]
-        }))
+        }
         
-        courses = list(db.courses.find({
+        students = list(db.users.find(student_query))
+        student_ids = [s['_id'] for s in students]
+        
+        # Search courses by title or code
+        course_query = {
             '$or': [
                 {'title': {'$regex': search_term, '$options': 'i'}},
                 {'course_code': {'$regex': search_term, '$options': 'i'}}
             ]
-        }))
+        }
         
-        student_ids = [s['_id'] for s in students]
+        courses = list(db.courses.find(course_query))
         course_ids = [c['_id'] for c in courses]
         
-        query = {'$or': []}
-        if student_ids:
-            query['$or'].append({'student_id': {'$in': student_ids}})
-        if course_ids:
-            query['$or'].append({'course_id': {'$in': course_ids}})
+        # Find enrollments
+        enrollments = list(db.enrollments.find({
+            '$or': [
+                {'student_id': {'$in': student_ids}},
+                {'course_id': {'$in': course_ids}}
+            ]
+        }).sort('enrolled_at', -1))
         
-        if not query['$or']:
-            return jsonify([])
-        
-        enrollments = list(db.enrollments.find(query).sort('enrolled_at', -1))
-        
-        # Add student and course info
         result = []
         for enrollment in enrollments:
             student = db.users.find_one({'_id': enrollment['student_id']})
@@ -2386,39 +3374,57 @@ def admin_search_enrollments():
             if student and course:
                 result.append({
                     'id': str(enrollment['_id']),
+                    'student_id': str(student['_id']),
                     'first_name': student.get('first_name', ''),
                     'last_name': student.get('last_name', ''),
-                    'student_id': student.get('student_id', ''),
-                    'email': student.get('email', ''),
-                    'level': student.get('level', ''),
-                    'department': student.get('department', ''),
+                    'student_id_display': student.get('student_id', ''),
+                    'course_id': str(course['_id']),
                     'course_title': course.get('title', ''),
                     'course_code': course.get('course_code', ''),
-                    'enrolled_at': enrollment.get('enrolled_at')
+                    'level': student.get('level', ''),
+                    'department': student.get('department', ''),
+                    'enrolled_at': enrollment['enrolled_at']
                 })
         
         return jsonify(result)
     except Exception as e:
+        logger.error(f"Admin search enrollments error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/enrollments/<enrollment_id>', methods=['DELETE'])
 @admin_required
-def admin_delete_enrollment(enrollment_id):
+def admin_remove_enrollment(enrollment_id):
     try:
         db = get_db()
         
-        result = db.enrollments.delete_one({'_id': ObjectId(enrollment_id)})
-        
-        if result.deleted_count == 0:
+        enrollment = db.enrollments.find_one({'_id': ObjectId(enrollment_id)})
+        if not enrollment:
             return jsonify({'error': 'Enrollment not found'}), 404
         
-        return jsonify({'message': 'Enrollment deleted successfully'})
+        db.enrollments.delete_one({'_id': ObjectId(enrollment_id)})
+        
+        # Notify student
+        student = db.users.find_one({'_id': enrollment['student_id']})
+        course = db.courses.find_one({'_id': enrollment['course_id']})
+        
+        if student and course:
+            create_notification(
+                db,
+                str(enrollment['student_id']),
+                'Removed from Course',
+                f'You have been removed from {course.get("title", "Course")} by administrator.',
+                'enrollment',
+                str(course['_id'])
+            )
+        
+        return jsonify({'message': 'Student removed from course successfully'})
     except Exception as e:
+        logger.error(f"Admin remove enrollment error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/students/<student_id>/enrollments', methods=['GET'])
 @admin_required
-def admin_get_student_enrollments(student_id):
+def get_student_enrollments(student_id):
     try:
         db = get_db()
         
@@ -2429,11 +3435,13 @@ def admin_get_student_enrollments(student_id):
             course = db.courses.find_one({'_id': enrollment['course_id']})
             
             if course:
-                # Get teacher info
-                teacher_courses = list(db.teacher_courses.find({'course_id': course['_id']}))
-                teacher_ids = [tc['teacher_id'] for tc in teacher_courses]
-                teachers = list(db.users.find({'_id': {'$in': teacher_ids}}))
-                teacher_name = ', '.join([f"{t['first_name']} {t['last_name']}" for t in teachers]) if teachers else 'Not assigned'
+                # Get teacher name
+                teacher_course = db.teacher_courses.find_one({'course_id': course['_id']})
+                teacher_name = 'Not assigned'
+                if teacher_course:
+                    teacher = db.users.find_one({'_id': teacher_course['teacher_id']})
+                    if teacher:
+                        teacher_name = f"{teacher.get('first_name', '')} {teacher.get('last_name', '')}"
                 
                 result.append({
                     'id': str(enrollment['_id']),
@@ -2441,314 +3449,447 @@ def admin_get_student_enrollments(student_id):
                     'course_code': course.get('course_code', ''),
                     'credits': course.get('credits', 0),
                     'teacher_name': teacher_name,
-                    'status': course.get('status', '')
+                    'status': course.get('status', 'active'),
+                    'enrolled_at': enrollment['enrolled_at']
                 })
         
         return jsonify(result)
     except Exception as e:
+        logger.error(f"Admin get student enrollments error: {e}")
         return jsonify({'error': str(e)}), 500
-
-@app.route('/api/admin/announcements', methods=['POST'])
-@admin_required
-def admin_create_announcement():
-    try:
-        data = request.json
-        db = get_db()
-        
-        admin = db.users.find_one({'_id': ObjectId(session['user_id'])})
-        
-        announcement = {
-            'title': data['title'],
-            'content': data['content'],
-            'target': data['target'],  # 'teachers' or 'students'
-            'admin_id': ObjectId(session['user_id']),
-            'admin_name': f"{admin.get('first_name', '')} {admin.get('last_name', '')}",
-            'created_at': datetime.utcnow()
-        }
-        
-        result = db.admin_announcements.insert_one(announcement)
-        
-        # Create notifications for target users
-        if data['target'] == 'teachers':
-            users = list(db.users.find({'role': 'teacher', 'status': 'active'}))
-        else:  # students
-            users = list(db.users.find({'role': 'student', 'status': 'active'}))
-        
-        for user in users:
-            create_notification(
-                db,
-                str(user['_id']),
-                f'Admin Announcement: {data["title"]}',
-                data['content'],
-                'admin_announcement',
-                str(result.inserted_id)
-            )
-        
-        return jsonify({'message': 'Announcement sent successfully'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/admin/announcements/recent', methods=['GET'])
-@admin_required
-def admin_get_recent_announcements():
-    try:
-        db = get_db()
-        
-        announcements = list(db.admin_announcements.find().sort('created_at', -1).limit(10))
-        
-        return jsonify(serialize_list(announcements))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/admin/pending-approvals', methods=['GET'])
-@admin_required
-def admin_get_pending_approvals():
-    try:
-        db = get_db()
-        
-        approvals = list(db.course_approval_requests.find({'status': 'pending'}).sort('requested_at', -1))
-        
-        result = []
-        for approval in approvals:
-            teacher = db.users.find_one({'_id': approval['teacher_id']})
-            course = db.courses.find_one({'_id': approval['course_id']})
-            
-            if teacher and course:
-                # Check if course has current teacher
-                current_teacher = db.teacher_courses.find_one({'course_id': approval['course_id']})
-                current_teacher_name = 'Not assigned'
-                if current_teacher:
-                    current_teacher_user = db.users.find_one({'_id': current_teacher['teacher_id']})
-                    if current_teacher_user:
-                        current_teacher_name = f"{current_teacher_user['first_name']} {current_teacher_user['last_name']}"
-                
-                result.append({
-                    'request_id': str(approval['_id']),
-                    'teacher_first_name': teacher.get('first_name', ''),
-                    'teacher_last_name': teacher.get('last_name', ''),
-                    'teacher_code': teacher.get('teacher_code', ''),
-                    'course_title': course.get('title', ''),
-                    'course_code': course.get('course_code', ''),
-                    'current_teacher': current_teacher_name,
-                    'requested_at': approval.get('requested_at')
-                })
-        
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/admin/approve-course-request/<request_id>', methods=['POST'])
-@admin_required
-def admin_approve_course_request(request_id):
-    try:
-        data = request.json
-        db = get_db()
-        
-        # Get the approval request
-        approval = db.course_approval_requests.find_one({'_id': ObjectId(request_id)})
-        if not approval:
-            return jsonify({'error': 'Approval request not found'}), 404
-        
-        if data['action'] == 'approve':
-            # Check if course has current teacher
-            current_teacher = db.teacher_courses.find_one({'course_id': approval['course_id']})
-            
-            if current_teacher and not data.get('reassign', False):
-                # Course already has a teacher, need reassignment confirmation
-                current_teacher_user = db.users.find_one({'_id': current_teacher['teacher_id']})
-                course = db.courses.find_one({'_id': approval['course_id']})
-                
-                return jsonify({
-                    'error': 'Course already assigned',
-                    'current_teacher': f"{current_teacher_user.get('first_name', '')} {current_teacher_user.get('last_name', '')}",
-                    'course_title': course.get('title', '') if course else ''
-                }), 409
-            
-            # Remove current teacher if reassigning
-            if current_teacher:
-                db.teacher_courses.delete_one({'course_id': approval['course_id']})
-            
-            # Assign course to requesting teacher
-            assignment = {
-                'teacher_id': approval['teacher_id'],
-                'course_id': approval['course_id'],
-                'assigned_at': datetime.utcnow()
-            }
-            
-            try:
-                db.teacher_courses.insert_one(assignment)
-            except DuplicateKeyError:
-                pass
-            
-            # Update approval status
-            db.course_approval_requests.update_one(
-                {'_id': ObjectId(request_id)},
-                {'$set': {
-                    'status': 'approved',
-                    'reviewed_at': datetime.utcnow(),
-                    'admin_id': ObjectId(session['user_id']),
-                    'admin_notes': data.get('notes', '')
-                }}
-            )
-            
-            # Create notification for teacher
-            course = db.courses.find_one({'_id': approval['course_id']})
-            create_notification(
-                db,
-                str(approval['teacher_id']),
-                'Course Request Approved',
-                f'Your request to teach {course.get("title", "course")} has been approved',
-                'approval',
-                str(approval['course_id'])
-            )
-            
-            return jsonify({'message': 'Course request approved successfully'})
-        
-        elif data['action'] == 'reject':
-            # Update approval status
-            db.course_approval_requests.update_one(
-                {'_id': ObjectId(request_id)},
-                {'$set': {
-                    'status': 'rejected',
-                    'reviewed_at': datetime.utcnow(),
-                    'admin_id': ObjectId(session['user_id']),
-                    'admin_notes': data.get('notes', '')
-                }}
-            )
-            
-            # Create notification for teacher
-            course = db.courses.find_one({'_id': approval['course_id']})
-            create_notification(
-                db,
-                str(approval['teacher_id']),
-                'Course Request Rejected',
-                f'Your request to teach {course.get("title", "course")} has been rejected',
-                'approval',
-                str(approval['course_id'])
-            )
-            
-            return jsonify({'message': 'Course request rejected successfully'})
-        
-        else:
-            return jsonify({'error': 'Invalid action'}), 400
     
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/admin/approval-history', methods=['GET'])
+@app.route('/api/admin/clear-all-courses', methods=['DELETE'])
 @admin_required
-def admin_get_approval_history():
+def clear_all_courses():
     try:
         db = get_db()
         
-        approvals = list(db.course_approval_requests.find().sort('requested_at', -1))
+        # Get count of courses before deletion
+        course_count = db.courses.count_documents({})
         
-        result = []
-        for approval in approvals:
-            teacher = db.users.find_one({'_id': approval['teacher_id']})
-            course = db.courses.find_one({'_id': approval['course_id']})
-            admin = db.users.find_one({'_id': approval.get('admin_id')}) if approval.get('admin_id') else None
-            
-            if teacher and course:
-                result.append({
-                    'teacher_first_name': teacher.get('first_name', ''),
-                    'teacher_last_name': teacher.get('last_name', ''),
-                    'course_title': course.get('title', ''),
-                    'status': approval.get('status', ''),
-                    'requested_at': approval.get('requested_at'),
-                    'reviewed_at': approval.get('reviewed_at'),
-                    'admin_name': f"{admin.get('first_name', '')} {admin.get('last_name', '')}" if admin else '',
-                    'admin_notes': approval.get('admin_notes', '')
-                })
+        # Delete all courses and related data
+        db.courses.delete_many({})
+        db.teacher_courses.delete_many({})
+        db.enrollments.delete_many({})
+        db.announcements.delete_many({})
+        db.assignments.delete_many({})
+        db.materials.delete_many({})
+        db.discussion_posts.delete_many({})
+        db.discussion_replies.delete_many({})
+        db.submissions.delete_many({})
         
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/admin/backup', methods=['GET'])
-@admin_required
-def admin_backup_database():
-    try:
-        db = get_db()
-        
-        # Get all collections data
-        backup_data = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'collections': {}
+        # Reinitialize compulsory courses
+        compulsory_courses_config = {
+            'MS1': [
+                ('Mathematics MS1', 'Mathematics for Middle School 1', 'MATH-MS1', 3, 'all', 'MS1', True),
+                ('English Language MS1', 'English Language for Middle School 1', 'ENG-MS1', 3, 'all', 'MS1', True),
+                ('Data Processing MS1', 'Data Processing for Middle School 1', 'DATA-PROC-MS1', 3, 'all', 'MS1', True)
+            ],
+            'MS2': [
+                ('Mathematics MS2', 'Mathematics for Middle School 2', 'MATH-MS2', 3, 'all', 'MS2', True),
+                ('English Language MS2', 'English Language for Middle School 2', 'ENG-MS2', 3, 'all', 'MS2', True),
+                ('Data Processing MS2', 'Data Processing for Middle School 2', 'DATA-PROC-MS2', 3, 'all', 'MS2', True)
+            ],
+            'MS3': [
+                ('Mathematics MS3', 'Mathematics for Middle School 3', 'MATH-MS3', 3, 'all', 'MS3', True),
+                ('English Language MS3', 'English Language for Middle School 3', 'ENG-MS3', 3, 'all', 'MS3', True),
+                ('Data Processing MS3', 'Data Processing for Middle School 3', 'DATA-PROC-MS3', 3, 'all', 'MS3', True)
+            ],
+            'HS1': [
+                ('Mathematics HS1', 'Mathematics for High School 1', 'MATH-HS1', 3, 'all', 'HS1', True),
+                ('English Language HS1', 'English Language for High School 1', 'ENG-HS1', 3, 'all', 'HS1', True),
+                ('Data Processing HS1', 'Data Processing for High School 1', 'DATA-PROC-HS1', 3, 'all', 'HS1', True)
+            ],
+            'HS2': [
+                ('Mathematics HS2', 'Mathematics for High School 2', 'MATH-HS2', 3, 'all', 'HS2', True),
+                ('English Language HS2', 'English Language for High School 2', 'ENG-HS2', 3, 'all', 'HS2', True),
+                ('Data Processing HS2', 'Data Processing for High School 2', 'DATA-PROC-HS2', 3, 'all', 'HS2', True)
+            ],
+            'HS3': [
+                ('Mathematics HS3', 'Mathematics for High School 3', 'MATH-HS3', 3, 'all', 'HS3', True),
+                ('English Language HS3', 'English Language for High School 3', 'ENG-HS3', 3, 'all', 'HS3', True),
+                ('Data Processing HS3', 'Data Processing for High School 3', 'DATA-PROC-HS3', 3, 'all', 'HS3', True)
+            ]
         }
         
-        collections = ['users', 'courses', 'teacher_courses', 'enrollments', 
-                      'announcements', 'assignments', 'submissions', 'materials',
-                      'discussion_posts', 'discussion_replies', 'notifications',
-                      'admin_announcements', 'course_approval_requests']
+        inserted_count = 0
+        for level, level_courses in compulsory_courses_config.items():
+            for title, description, code, credits, department, level_name, is_compulsory in level_courses:
+                db.courses.insert_one({
+                    'title': title,
+                    'description': description,
+                    'course_code': code,
+                    'credits': credits,
+                    'teacher_lock': True,
+                    'status': 'active',
+                    'level': level_name,
+                    'department': department,
+                    'is_compulsory': is_compulsory,
+                    'created_at': datetime.utcnow()
+                })
+                inserted_count += 1
         
-        for collection_name in collections:
-            collection = db[collection_name]
-            documents = list(collection.find())
-            backup_data['collections'][collection_name] = serialize_list(documents)
-        
-        # Return as JSON
-        from flask import make_response
-        response = make_response(json.dumps(backup_data, indent=2))
-        response.headers['Content-Type'] = 'application/json'
-        response.headers['Content-Disposition'] = f'attachment; filename=lms_backup_{datetime.utcnow().strftime("%Y%m%d_%H%M%S")}.json'
-        
-        return response
+        return jsonify({
+            'message': f'All courses cleared and {inserted_count} compulsory courses reinitialized',
+            'deleted_count': course_count,
+            'inserted_count': inserted_count
+        })
     except Exception as e:
+        logger.error(f"Admin clear all courses error: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/admin/reset', methods=['POST'])
+@app.route('/api/admin/fee-management', methods=['GET'])
 @admin_required
-def admin_reset_system():
+def admin_fee_management():
     try:
         db = get_db()
         
-        # Keep admin accounts
-        admins = list(db.users.find({'role': 'admin'}))
+        # Get all fee payments with student info
+        payments = list(db.fee_payments.find().sort('payment_date', -1))
         
-        # Clear all data except admin accounts
-        collections_to_clear = ['courses', 'teacher_courses', 'enrollments', 
-                              'announcements', 'assignments', 'submissions', 'materials',
-                              'discussion_posts', 'discussion_replies', 'notifications',
-                              'admin_announcements', 'course_approval_requests']
+        result = []
+        for payment in payments:
+            student = db.users.find_one({'_id': payment['student_id']})
+            if student:
+                payment['student_name'] = f"{student.get('first_name', '')} {student.get('last_name', '')}"
+                payment['student_id_display'] = student.get('student_id', '')
+                payment['student_level'] = student.get('level', '')
+                payment['student_department'] = student.get('department', '')
+                payment['student_email'] = student.get('email', '')
+            
+            if payment.get('created_by'):
+                creator = db.users.find_one({'_id': payment['created_by']})
+                if creator:
+                    payment['created_by_name'] = f"{creator.get('first_name', '')} {creator.get('last_name', '')}"
+            
+            if payment.get('approved_by'):
+                approver = db.users.find_one({'_id': payment['approved_by']})
+                if approver:
+                    payment['approved_by_name'] = f"{approver.get('first_name', '')} {approver.get('last_name', '')}"
+            
+            result.append(serialize_doc(payment))
         
-        # Clear student and teacher accounts
-        db.users.delete_many({'role': {'$in': ['student', 'teacher']}})
+        # Get summary statistics
+        total_payments = len(payments)
+        approved_payments = len([p for p in payments if p.get('status') == 'approved'])
+        pending_payments = len([p for p in payments if p.get('status') == 'pending'])
+        rejected_payments = len([p for p in payments if p.get('status') == 'rejected'])
+        total_amount = sum(p['amount'] for p in payments if p.get('status') == 'approved')
         
-        # Clear other collections
-        for collection_name in collections_to_clear:
-            db[collection_name].delete_many({})
+        # Get students with pending fee payments
+        students_with_pending_fees = list(db.users.find({
+            'role': 'student',
+            'fee_payment_required': True
+        }))
         
-        return jsonify({'message': 'System reset successfully'})
+        students_list = []
+        for student in students_with_pending_fees:
+            student_payments = list(db.fee_payments.find({
+                'student_id': student['_id'],
+                'status': 'approved'
+            }))
+            has_approved_payment = len(student_payments) > 0
+            
+            students_list.append({
+                'id': str(student['_id']),
+                'name': f"{student.get('first_name', '')} {student.get('last_name', '')}",
+                'student_id': student.get('student_id', ''),
+                'level': student.get('level', ''),
+                'department': student.get('department', ''),
+                'email': student.get('email', ''),
+                'has_approved_payment': has_approved_payment,
+                'last_payment_date': student_payments[0]['payment_date'].isoformat() if student_payments else None,
+                'last_payment_amount': student_payments[0]['amount'] if student_payments else 0
+            })
+        
+        return jsonify({
+            'payments': result,
+            'statistics': {
+                'total_payments': total_payments,
+                'approved_payments': approved_payments,
+                'pending_payments': pending_payments,
+                'rejected_payments': rejected_payments,
+                'total_amount': total_amount
+            },
+            'students_with_fees': students_list
+        })
     except Exception as e:
+        logger.error(f"Admin fee management error: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/fee-payments/summary', methods=['GET'])
+@admin_required
+def fee_payments_summary():
+    try:
+        db = get_db()
+        
+        # Get current academic year
+        current_year = datetime.now().year
+        
+        # Get payments by status
+        payments = list(db.fee_payments.find({
+            'academic_year': current_year
+        }))
+        
+        # Calculate statistics by month
+        monthly_stats = {}
+        for payment in payments:
+            month = payment['payment_date'].strftime('%Y-%m')
+            if month not in monthly_stats:
+                monthly_stats[month] = {
+                    'total': 0,
+                    'approved': 0,
+                    'pending': 0,
+                    'rejected': 0
+                }
+            
+            monthly_stats[month]['total'] += payment['amount']
+            if payment['status'] == 'approved':
+                monthly_stats[month]['approved'] += payment['amount']
+            elif payment['status'] == 'pending':
+                monthly_stats[month]['pending'] += payment['amount']
+            elif payment['status'] == 'rejected':
+                monthly_stats[month]['rejected'] += payment['amount']
+        
+        # Get payments by level
+        level_stats = {}
+        for payment in payments:
+            student = db.users.find_one({'_id': payment['student_id']})
+            if student:
+                level = student.get('level', 'Unknown')
+                if level not in level_stats:
+                    level_stats[level] = {
+                        'total': 0,
+                        'count': 0
+                    }
+                level_stats[level]['total'] += payment['amount']
+                level_stats[level]['count'] += 1
+        
+        # Get recent payments
+        recent_payments = list(db.fee_payments.find()
+                              .sort('payment_date', -1)
+                              .limit(10))
+        
+        recent_list = []
+        for payment in recent_payments:
+            student = db.users.find_one({'_id': payment['student_id']})
+            if student:
+                recent_list.append({
+                    'id': str(payment['_id']),
+                    'student_name': f"{student.get('first_name', '')} {student.get('last_name', '')}",
+                    'student_id': student.get('student_id', ''),
+                    'amount': payment['amount'],
+                    'status': payment['status'],
+                    'payment_date': payment['payment_date'].isoformat(),
+                    'receipt_number': payment.get('receipt_number', '')
+                })
+        
+        return jsonify({
+            'monthly_stats': monthly_stats,
+            'level_stats': level_stats,
+            'recent_payments': recent_list,
+            'current_year': current_year
+        })
+    except Exception as e:
+        logger.error(f"Fee payments summary error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/students/<student_id>/toggle-fee-requirement', methods=['POST'])
+@admin_required
+def toggle_student_fee_requirement(student_id):
+    try:
+        db = get_db()
+        
+        student = db.users.find_one({'_id': ObjectId(student_id), 'role': 'student'})
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        current_status = student.get('fee_payment_required', True)
+        new_status = not current_status
+        
+        db.users.update_one(
+            {'_id': ObjectId(student_id)},
+            {'$set': {'fee_payment_required': new_status}}
+        )
+        
+        action = 'enabled' if new_status else 'disabled'
+        return jsonify({
+            'message': f'Fee payment requirement {action} for student',
+            'fee_payment_required': new_status
+        })
+    except Exception as e:
+        logger.error(f"Toggle student fee requirement error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ==============================================
+# MISCELLANEOUS ROUTES
+# ==============================================
+
+@app.route('/api/courses/<course_id>/students', methods=['GET'])
+@login_required
+def get_course_students(course_id):
+    try:
+        db = get_db()
+        
+        # Check if user has access to this course
+        if session.get('role') == 'student':
+            enrollment = db.enrollments.find_one({
+                'student_id': ObjectId(session['user_id']),
+                'course_id': ObjectId(course_id)
+            })
+            if not enrollment:
+                return jsonify({'error': 'Unauthorized'}), 403
+        elif session.get('role') == 'teacher':
+            teacher_course = db.teacher_courses.find_one({
+                'teacher_id': ObjectId(session['user_id']),
+                'course_id': ObjectId(course_id)
+            })
+            if not teacher_course:
+                return jsonify({'error': 'Unauthorized'}), 403
+        
+        enrollments = list(db.enrollments.find({'course_id': ObjectId(course_id)}))
+        student_ids = [e['student_id'] for e in enrollments]
+        students = list(db.users.find({'_id': {'$in': student_ids}, 'role': 'student'}))
+        
+        return jsonify(serialize_list(students))
+    except Exception as e:
+        logger.error(f"Get course students error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/teachers/<teacher_id>/courses/<course_id>/students/<student_id>', methods=['DELETE'])
+@teacher_required
+def teacher_remove_student(teacher_id, course_id, student_id):
+    try:
+        if session['user_id'] != teacher_id:
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        db = get_db()
+        
+        # Verify teacher is assigned to this course
+        teacher_course = db.teacher_courses.find_one({
+            'teacher_id': ObjectId(teacher_id),
+            'course_id': ObjectId(course_id)
+        })
+        
+        if not teacher_course:
+            return jsonify({'error': 'Teacher not assigned to this course'}), 403
+        
+        # Remove enrollment
+        result = db.enrollments.delete_one({
+            'student_id': ObjectId(student_id),
+            'course_id': ObjectId(course_id)
+        })
+        
+        if result.deleted_count == 0:
+            return jsonify({'error': 'Student not enrolled in this course'}), 404
+        
+        # Notify student
+        student = db.users.find_one({'_id': ObjectId(student_id)})
+        course = db.courses.find_one({'_id': ObjectId(course_id)})
+        
+        if student and course:
+            create_notification(
+                db,
+                student_id,
+                'Removed from Course',
+                f'You have been removed from {course.get("title", "Course")} by your teacher.',
+                'enrollment',
+                course_id
+            )
+        
+        return jsonify({'message': 'Student removed from course successfully'})
+    except Exception as e:
+        logger.error(f"Teacher remove student error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ==============================================
+# ERROR HANDLING
+# ==============================================
+
+@app.errorhandler(404)
+def not_found_error(error):
+    return jsonify({'error': 'Resource not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    logger.error(f'Server Error: {error}')
+    return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(Exception)
+def handle_error(error):
+    logger.error(f'Unhandled Error: {str(error)}')
+    return jsonify({'error': 'Internal server error'}), 500
 
 # ==============================================
 # MAIN ENTRY POINT
 # ==============================================
 
+def signal_handler(sig, frame):
+    """Handle graceful shutdown"""
+    print('\n👋 Shutting down gracefully...')
+    # Additional cleanup if needed
+    sys.exit(0)
+
 if __name__ == '__main__':
-    init_db()
-    print("\n" + "="*60)
-    print("🎓 SCHOOL LEARNING MANAGEMENT SYSTEM (MongoDB)")
-    print("="*60)
-    print("\n📌 Open your browser and go to:")
-    print("   ➡️  http://localhost:5000")
-    print("\n🔐 Login Credentials:")
-    print("   👑 Admin:      admin@school.edu / admin123")
-    print("   👨‍🏫 Teacher:   teacher@school.edu / teacher123")
-    print("   👨‍🎓 Students:  Register on the portal")
-    print("\n📚 Level System:")
-    print("   🏫 Middle School: MS1, MS2, MS3")
-    print("   🎓 High School:   HS1, HS2, HS3 (Department required)")
-    print("\n📖 Compulsory Courses:")
-    print("   1. Mathematics")
-    print("   2. English Language")
-    print("   3. Data Processing")
-    print("\n🔧 Health Check:")
-    print("   🌐 http://localhost:5000/api/health")
-    print("\n" + "="*60 + "\n")
-    app.run(debug=True, port=5000, host='0.0.0.0', threaded=True)
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        # Initialize database
+        init_db()
+        
+        # Determine environment
+        debug_mode = os.environ.get('FLASK_ENV') == 'development'
+        
+        # Configure for production/development
+        app.config['SESSION_COOKIE_SECURE'] = not debug_mode
+        app.config['DEBUG'] = debug_mode
+        
+        # Get port and host from environment or use defaults
+        port = int(os.environ.get('PORT', 5000))
+        host = os.environ.get('HOST', '0.0.0.0')
+        
+        print("\n" + "="*60)
+        print("🎓 SCHOOL LEARNING MANAGEMENT SYSTEM (MongoDB)")
+        print("="*60)
+        print(f"\n🏃 Running in {'DEBUG' if debug_mode else 'PRODUCTION'} mode")
+        print(f"🌐 Server URL: http://{host}:{port}")
+        print("\n🔐 Login Credentials:")
+        print("   👑 Admin:      admin@school.edu / admin123")
+        print("   👨‍🏫 Teacher:   teacher@school.edu / teacher123")
+        print("   👨‍🎓 Students:  Register on the portal")
+        print("\n💰 Fee Payment System:")
+        print("   • Students need fee payment approval to access courses")
+        print("   • Admin can record and approve fee payments")
+        print("   • Students locked until admin approves fees")
+        print("\n📚 Level System:")
+        print("   🏫 Middle School: MS1, MS2, MS3")
+        print("   🎓 High School:   HS1, HS2, HS3 (Department required)")
+        print("\n📖 Compulsory Courses:")
+        print("   1. Mathematics")
+        print("   2. English Language")
+        print("   3. Data Processing")
+        print("\n🔧 Health Check:")
+        print(f"   🌐 http://{host}:{port}/api/health")
+        print("\n" + "="*60 + "\n")
+        
+        # Run the application
+        app.run(
+            debug=debug_mode,
+            port=port,
+            host=host,
+            threaded=True
+        )
+        
+    except KeyboardInterrupt:
+        print("\n👋 Server stopped by user")
+    except Exception as e:
+        print(f"\n❌ Fatal error starting server: {e}")
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
 else:
-    # For Vercel deployment
+    # For production deployment (e.g., Vercel, Gunicorn)
     init_db()
+    logger.info("✅ Application initialized for production deployment")
